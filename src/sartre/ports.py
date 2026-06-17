@@ -43,7 +43,12 @@ class Registry(Protocol):
         ...
 
     def list_versions(self, coord: Coordinate) -> Sequence[Version]:
-        """Return the known immutable versions of a coordinate."""
+        """Return the coordinate's versions in commit-log order (oldest first).
+
+        Contract: because version ids are content hashes and carry no intrinsic
+        order, ordering is the commit log's authoritative sequence, not anything
+        derived from the version values.
+        """
         ...
 
     def commit(
@@ -51,10 +56,12 @@ class Registry(Protocol):
     ) -> Version:
         """Record a new immutable manifest version and return its id.
 
-        Contract: committing does NOT advance any mutable pointer. Whether
-        committing identical entries returns the same version
-        (content-idempotency) depends on the version-id format and is
-        deliberately left TBD pending that decision.
+        Contract: committing does NOT advance any mutable pointer. Committing is
+        content-idempotent — committing the same ``(path, content_hash)`` entries
+        returns the same :data:`~sartre.model.Version` and stores no duplicate
+        manifest, regardless of ``metadata``, entry order, or coordinate (the
+        version is the content hash of the manifest; see
+        :func:`sartre.hashing.manifest_version`).
         """
         ...
 

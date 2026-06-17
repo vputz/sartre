@@ -15,8 +15,13 @@ from typing import Any
 # Self-describing content hash, ``"<algo>:<digest>"`` (see sartre.hashing).
 type Hash = str
 
-# Opaque immutable version identifier. Consumers MUST NOT parse or order it by
-# structure; the concrete format is deliberately not fixed by this capability.
+# Immutable version identifier: the content hash of the canonical manifest
+# entries (self-describing "<algo>:<digest>", see sartre.hashing.manifest_version).
+# Identity is the entries' sorted (path, content_hash) pairs only — it EXCLUDES
+# size, inline bytes, metadata, and the coordinate, so identical files always
+# yield the same version (enabling manifest dedup and free cross-env promotion).
+# Consumers MUST treat it as opaque and MUST NOT parse or order it by structure;
+# ordering comes from the commit log, not the id.
 type Version = str
 
 

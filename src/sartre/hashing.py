@@ -9,9 +9,19 @@ later as an alternative ``Hasher`` without changing existing keys.
 from __future__ import annotations
 
 import hashlib
-from typing import BinaryIO, Protocol, runtime_checkable
+import io
+from typing import TYPE_CHECKING, BinaryIO, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from sartre.model import Entry, Version
 
 _CHUNK = 1 << 20  # 1 MiB streaming reads — never buffer a whole blob
+
+# Domain separator for manifest hashing, so a version id can never equal a raw
+# blob key and the encoding can be evolved (bump the tag) without silent reuse.
+_MANIFEST_DOMAIN = b"sartre-manifest-v1\n"
 
 
 def make_key(algorithm: str, digest: str) -> str:
@@ -60,3 +70,18 @@ class Sha256Hasher:
 
 
 DEFAULT_HASHER: Hasher = Sha256Hasher()
+
+
+def manifest_version(entries: Iterable[Entry], hasher: Hasher = DEFAULT_HASHER) -> Version:
+    """Compute a manifest's version: the content hash of its canonical entries.
+
+    Identity is the sorted ``(path, content_hash)`` pairs only — ``size``, inline
+    bytes, ``metadata``, and the coordinate are deliberately excluded, so
+    identical files always yield the same version (enabling manifest dedup and
+    free cross-env promotion). The serialization is sorted (order-independent),
+    NUL-separated, and domain-tagged; the result is a self-describing key from
+    ``hasher``.
+    """
+    lines = sorted(f"{entry.path}\x00{entry.content_hash}" for entry in entries)
+    payload = _MANIFEST_DOMAIN + "\n".join(lines).encode("utf-8")
+    return hasher.hash(io.BytesIO(payload))

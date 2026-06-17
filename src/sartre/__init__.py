@@ -22,6 +22,7 @@ from sartre.hashing import (
     Sha256Hasher,
     algorithm_of,
     make_key,
+    manifest_version,
     parse_key,
 )
 from sartre.model import (
@@ -72,6 +73,7 @@ __all__ = [
     "algorithm_of",
     "check_no_case_collisions",
     "make_key",
+    "manifest_version",
     "normalize_path",
     "parse_key",
 ]
