@@ -22,18 +22,37 @@ The `Registry` SHALL expose `resolve(coord, ref=Head()) -> Snapshot`. Resolution
 - **THEN** the call raises a typed not-found error
 
 ### Requirement: Pointer and version enumeration
-The `Registry` SHALL expose `list_pointers(coord) -> Mapping[name, version]` and `list_versions(coord) -> Sequence[version]` for reproducibility and operational tooling.
+The `Registry` SHALL expose `list_pointers(coord) -> Mapping[name, version]` and
+`list_versions(coord) -> Sequence[version]` for reproducibility and operational
+tooling. `list_versions` SHALL return the coordinate's versions in commit-log
+order (oldest to newest by the log's authoritative sequence).
 
 #### Scenario: Enumerate pointers
-- **WHEN** `list_pointers` is called for a coordinate with `head` and `production` pointers
-- **THEN** it returns a mapping including both pointer names and their current version ids
+- **WHEN** `list_pointers` is called for a coordinate with `head` and
+  `production` pointers
+- **THEN** it returns a mapping including both pointer names and their current
+  version ids
+
+#### Scenario: Versions enumerated in commit order
+- **WHEN** `list_versions` is called for a coordinate with three logged versions
+- **THEN** they are returned in the order they were committed, oldest first
 
 ### Requirement: Immutable manifest commit
-The `Registry` SHALL expose `commit(coord, entries, metadata) -> Version` that records a new immutable manifest version. Committing SHALL NOT by itself advance any mutable pointer. Whether committing identical entries returns the same version (content-idempotency) depends on the version-id format and is left to a follow-up decision.
+The `Registry` SHALL expose `commit(coord, entries, metadata) -> Version` that
+records a new immutable manifest version. Committing SHALL NOT by itself advance
+any mutable pointer. Committing SHALL be **content-idempotent**: committing the
+same set of `(path, content_hash)` entries SHALL return the same `Version` and
+SHALL NOT create a duplicate manifest, regardless of `metadata`, entry order, or
+coordinate.
 
 #### Scenario: Commit does not move a pointer
 - **WHEN** `commit` records a new version
-- **THEN** existing pointers continue to resolve to their prior versions until explicitly advanced
+- **THEN** existing pointers continue to resolve to their prior versions until
+  explicitly advanced
+
+#### Scenario: Re-committing identical entries is idempotent
+- **WHEN** `commit` is called twice with the same `(path, content_hash)` entries
+- **THEN** both calls return the same `Version` and no duplicate manifest is stored
 
 ### Requirement: Compare-and-swap pointer update
 The `Registry` SHALL expose `set_pointer(coord, name, version, *, expected)` that atomically advances a mutable pointer only if its current value equals `expected`. On mismatch the call SHALL raise a typed conflict error and leave the pointer unchanged.
