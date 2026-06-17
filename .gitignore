@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# uv / virtualenv
+.venv/
+
+# Test / type / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
+coverage.xml
+
+# direnv
+.direnv/
+.envrc
+
+# Editor / tooling local state
+.codemogger/
+.serena/
+.vscode/
+*.swp
+
+# TLA+ model checker output
+*.toolbox/
+states/
+*.st
+MC.out
+
+# OS
+.DS_Store

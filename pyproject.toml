@@ -1,0 +1,50 @@
+[project]
+name = "sartre"
+version = "0.1.0"
+description = "Sartre: Simple ARTifact REpository — a content-addressed versioned binary artifact repository (manifest plane + blob plane)."
+readme = "README.md"
+authors = [
+    { name = "Vic Putz", email = "vputz@protonmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+# Optional backends. The reference read core (head/resolve/open) is designed to
+# run against a local-filesystem stub with no extra deps; the Delta + S3 backend
+# pulls these in. See binary-artifact-repo-design.md.
+[project.optional-dependencies]
+delta = [
+    "deltalake>=0.18",
+    "pyarrow>=16",
+]
+s3 = [
+    "boto3>=1.34",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.17,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "pyright>=1.1.390",
+]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
