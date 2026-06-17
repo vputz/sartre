@@ -42,3 +42,8 @@ tests/              tests
 openspec/           spec-driven change proposals & specs
 binary-artifact-repo-design.md   design memo
 ```
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE) — permissive, commercial-use
+friendly, with an explicit patent grant. See [`NOTICE`](NOTICE).

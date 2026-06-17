@@ -3,6 +3,8 @@ name = "sartre"
 version = "0.1.0"
 description = "Sartre: Simple ARTifact REpository — a content-addressed versioned binary artifact repository (manifest plane + blob plane)."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "Vic Putz", email = "vputz@protonmail.com" }
 ]
