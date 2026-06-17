@@ -21,10 +21,12 @@ from sartre.hashing import (
     Hasher,
     Sha256Hasher,
     algorithm_of,
+    hasher_for,
     make_key,
     manifest_version,
     parse_key,
 )
+from sartre.memory import MemoryRegistry
 from sartre.model import (
     HEAD,
     Alias,
@@ -58,6 +60,7 @@ __all__ = [
     "Hasher",
     "Head",
     "IntegrityError",
+    "MemoryRegistry",
     "NotFound",
     "PathError",
     "Pin",
@@ -72,6 +75,7 @@ __all__ = [
     "Version",
     "algorithm_of",
     "check_no_case_collisions",
+    "hasher_for",
     "make_key",
     "manifest_version",
     "normalize_path",

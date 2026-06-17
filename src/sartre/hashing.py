@@ -71,6 +71,19 @@ class Sha256Hasher:
 
 DEFAULT_HASHER: Hasher = Sha256Hasher()
 
+# Registry of supported hash algorithms, so a reader can verify a blob using the
+# algorithm named in its self-describing key (which may differ from the writer's
+# default hasher).
+_HASHERS: dict[str, Hasher] = {Sha256Hasher.algorithm: Sha256Hasher()}
+
+
+def hasher_for(algorithm: str) -> Hasher:
+    """Return the `Hasher` for a content-key algorithm, or raise `ValueError`."""
+    try:
+        return _HASHERS[algorithm]
+    except KeyError:
+        raise ValueError(f"unsupported hash algorithm: {algorithm!r}") from None
+
 
 def manifest_version(entries: Iterable[Entry], hasher: Hasher = DEFAULT_HASHER) -> Version:
     """Compute a manifest's version: the content hash of its canonical entries.

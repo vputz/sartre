@@ -1,15 +1,13 @@
-"""Smoke tests that the stub implementations structurally satisfy the ports.
+"""Structural conformance of the implementations to the ports.
 
-These verify the interface skeleton is internally consistent: the deferred
-implementations expose exactly the methods their Protocols require, and the
-read-only / deferred contracts raise as documented. Bodies are not implemented
-in this change, so calls raise ``NotImplementedError``.
+`SnapshotFS`/`checkout` remain stubbed (deferred to a follow-up change), so their
+read-only contract is checked here; the blob-plane stores and the in-memory
+registry are now implemented and verified behaviorally in their own test modules.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import cast
 
 import fsspec
 import pytest
@@ -20,8 +18,8 @@ from sartre import (
     CasStore,
     Coordinate,
     FsspecBlobBackend,
+    MemoryRegistry,
     Registry,
-    Repository,
     Snapshot,
     SnapshotFS,
     Store,
@@ -50,6 +48,10 @@ def test_cas_and_caching_stores_satisfy_store_protocol() -> None:
     assert isinstance(CachingStore(local=cas, remote=cas), Store)
 
 
+def test_memory_registry_satisfies_registry_protocol() -> None:
+    assert isinstance(MemoryRegistry(), Registry)
+
+
 def test_snapshotfs_is_read_only() -> None:
     store = CasStore(FsspecBlobBackend(fsspec.filesystem("memory"), "b"))
     fs = SnapshotFS(_empty_snapshot(), store)
@@ -57,33 +59,3 @@ def test_snapshotfs_is_read_only() -> None:
         fs._open("a.txt", mode="wb")
     with pytest.raises(PermissionError):
         fs._rm("a.txt")
-
-
-def test_repository_read_methods_are_deferred() -> None:
-    backend = FsspecBlobBackend(fsspec.filesystem("memory"), root="blobs")
-    registry = cast(Registry, _DeferredRegistry())
-    repo = Repository(registry=registry, store=CasStore(backend))
-    with pytest.raises(NotImplementedError):
-        repo.resolve(Coordinate("models", "release"))
-
-
-class _DeferredRegistry:
-    """A throwaway object with the Registry surface, for constructing a Repository."""
-
-    def head(self, *a: object, **k: object) -> str:
-        raise NotImplementedError
-
-    def resolve(self, *a: object, **k: object) -> object:
-        raise NotImplementedError
-
-    def list_pointers(self, *a: object, **k: object) -> object:
-        raise NotImplementedError
-
-    def list_versions(self, *a: object, **k: object) -> object:
-        raise NotImplementedError
-
-    def commit(self, *a: object, **k: object) -> str:
-        raise NotImplementedError
-
-    def set_pointer(self, *a: object, **k: object) -> None:
-        raise NotImplementedError

@@ -1,24 +1,30 @@
 """``Repository`` facade and the ``AsyncRepository`` wrapper.
 
-Interface stubs. ``Repository`` composes a ``Registry`` and a ``Store`` and
-exposes the read surface plus ``publish``; multi-file operations parallelize over
-a thread pool (blob I/O releases the GIL — no async core needed).
-``AsyncRepository`` offers awaitable equivalents by offloading the sync core to a
-thread, never duplicating its logic. Method bodies are deferred to a follow-up
-change.
+``Repository`` composes a ``Registry`` and a ``Store`` and implements the read
+core (`head`/`resolve`/`open`/`fetch_all`) and the write path (`publish`).
+Multi-file fetches parallelize over a thread pool (blob I/O releases the GIL).
+``AsyncRepository`` offers awaitable equivalents by offloading to a thread.
+
+`SnapshotFS`/`checkout` are deferred to a follow-up change.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping
+import io
+import tempfile
+from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
 
-from sartre.model import HEAD, Coordinate, Entry, Ref, Snapshot, Version
+from sartre.errors import NotFound
+from sartre.model import HEAD, Alias, Coordinate, Entry, Head, Ref, Snapshot, Version
+from sartre.paths import check_no_case_collisions, normalize_path
 from sartre.ports import Registry, Store
 
-_DEFERRED = "implementation deferred to a follow-up change (add-core-ports is interface-only)"
+
+def _pointer_ref(pointer: str) -> Ref:
+    return Head() if pointer == "head" else Alias(pointer)
 
 
 class Repository:
@@ -29,35 +35,62 @@ class Repository:
         self.store = store
 
     def head(self, coord: Coordinate, ref: Ref = HEAD) -> Version:
-        raise NotImplementedError(_DEFERRED)
+        return self.registry.head(coord, ref)
 
     def resolve(self, coord: Coordinate, ref: Ref = HEAD) -> Snapshot:
-        raise NotImplementedError(_DEFERRED)
+        return self.registry.resolve(coord, ref)
+
+    def _entry(self, snap: Snapshot, path: str) -> Entry:
+        for entry in snap.entries:
+            if entry.path == path:
+                return entry
+        raise NotFound(f"no entry {path!r} in {snap.coord} @ {snap.version}")
+
+    def _materialize(self, entry: Entry, dest: Path) -> Path:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if entry.inline is not None:  # small files served from the manifest row
+            dest.write_bytes(entry.inline)
+            return dest
+        return self.store.get_to(entry.content_hash, dest)
 
     def open(self, snap: Snapshot, path: str) -> Path:
         """Materialize one entry's bytes to a local path, cached by content hash."""
-        raise NotImplementedError(_DEFERRED)
+        entry = self._entry(snap, path)
+        dest = Path(tempfile.mkdtemp(prefix="sartre-open-")) / Path(path).name
+        return self._materialize(entry, dest)
 
     def fetch_all(self, snap: Snapshot, *, max_workers: int = 8) -> Path:
-        """Materialize the whole snapshot, fetching blobs in parallel."""
-        raise NotImplementedError(_DEFERRED)
-
-    def checkout(
-        self, snap: Snapshot, dest: Path, *, max_workers: int = 8, link: str = "copy"
-    ) -> Path:
-        """Lay out the snapshot as a directory tree by logical path under ``dest``."""
-        raise NotImplementedError(_DEFERRED)
+        """Materialize the whole snapshot to a directory by logical path, in parallel."""
+        root = Path(tempfile.mkdtemp(prefix="sartre-fetch-"))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(lambda e: self._materialize(e, root / e.path), snap.entries))
+        return root
 
     def publish(
         self,
         coord: Coordinate,
-        entries: Iterable[Entry],
+        files: Mapping[str, bytes],
         *,
         pointer: str = "head",
-        metadata: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, object] | None = None,
     ) -> Version:
-        """Upload missing blobs, commit the manifest, then CAS-advance the pointer."""
-        raise NotImplementedError(_DEFERRED)
+        """Full-replacement, fail-fast publish: blobs → manifest → CAS pointer."""
+        # Canonicalize paths and reject case-collisions up front (write-time path model).
+        normalized = {normalize_path(path): data for path, data in files.items()}
+        check_no_case_collisions(normalized)
+
+        try:
+            start: Version | None = self.registry.head(coord, _pointer_ref(pointer))
+        except NotFound:
+            start = None  # first publish to this pointer
+
+        entries = tuple(
+            Entry(path=path, content_hash=self.store.put(io.BytesIO(data)), size=len(data))
+            for path, data in sorted(normalized.items())
+        )
+        version = self.registry.commit(coord, entries, dict(metadata or {}))
+        self.registry.set_pointer(coord, pointer, version, expected=start)  # CAS; raises Conflict
+        return version
 
 
 class AsyncRepository:
