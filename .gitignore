@@ -27,6 +27,8 @@ coverage.xml
 .serena/
 .vscode/
 *.swp
+# Emacs undo-tree persistence
+*~undo-tree~
 
 # TLA+ model checker output
 *.toolbox/

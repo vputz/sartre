@@ -3,6 +3,8 @@
 **S**imple **ART**ifact **RE**pository — a generic, content-addressed
 **versioned binary artifact repository**.
 
+> "Hell is other people's artifact repositories" -- Jean-Paul Sartre
+
 Two cleanly separated planes:
 
 - **Manifest plane** — a transactional metadata store (Delta Lake over S3, or any
