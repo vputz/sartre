@@ -11,6 +11,7 @@ pkgs.mkShell {
 
     # Spec-driven development
     pkgs.openspec
+    pkgs.pandoc        # bin/openspec-preview renders change artifacts to HTML
 
     # TLA+ model checking (tla-* skills)
     pkgs.tlaplus

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Preview an OpenSpec change's artifacts (proposal → design → specs → tasks)
+# as a single rendered HTML page in the browser.
+#
+# Usage:
+#   openspec-preview <change-name>     # render that change's artifacts
+#   openspec-preview                   # list available changes
+#
+# Order mirrors the OpenSpec build order: proposal.md, design.md,
+# specs/<capability>/spec.md (sorted), tasks.md. Missing artifacts are skipped.
+#
+# Env:
+#   PREVIEW_OUT   override the output HTML path (default: /tmp/openspec-preview.html)
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+changes_dir="$repo_root/openspec/changes"
+
+list_changes() {
+  echo "Usage: openspec-preview <change-name>" >&2
+  if [ -d "$changes_dir" ]; then
+    echo "" >&2
+    echo "Available changes:" >&2
+    find "$changes_dir" -mindepth 1 -maxdepth 1 -type d ! -name archive -printf '  %f\n' 2>/dev/null | sort >&2
+  fi
+}
+
+if [ $# -eq 0 ]; then
+  list_changes
+  exit 1
+fi
+
+change="$1"
+change_dir="$changes_dir/$change"
+
+if [ ! -d "$change_dir" ]; then
+  echo "Error: no such change '$change' at $change_dir" >&2
+  list_changes
+  exit 1
+fi
+
+command -v pandoc >/dev/null 2>&1 || { echo "Error: pandoc not found on PATH" >&2; exit 1; }
+
+# Collect artifacts in OpenSpec build order; skip any that don't exist.
+artifacts=()
+[ -f "$change_dir/proposal.md" ] && artifacts+=("$change_dir/proposal.md")
+[ -f "$change_dir/design.md" ]   && artifacts+=("$change_dir/design.md")
+if [ -d "$change_dir/specs" ]; then
+  while IFS= read -r f; do artifacts+=("$f"); done \
+    < <(find "$change_dir/specs" -name '*.md' -type f | sort)
+fi
+[ -f "$change_dir/tasks.md" ]    && artifacts+=("$change_dir/tasks.md")
+
+if [ ${#artifacts[@]} -eq 0 ]; then
+  echo "Error: no markdown artifacts found under $change_dir" >&2
+  exit 1
+fi
+
+out="${PREVIEW_OUT:-/tmp/openspec-preview.html}"
+combined="$(mktemp /tmp/openspec-preview-XXXXXX.md)"
+trap 'rm -f "$combined"' EXIT
+
+# A little CSS for readable typography and a sticky-ish TOC.
+css="$(mktemp /tmp/openspec-preview-css-XXXXXX.html)"
+trap 'rm -f "$combined" "$css"' EXIT
+cat > "$css" <<'EOF'
+<style>
+  body { max-width: 50rem; margin: 2rem auto; padding: 0 1rem;
+         font-family: -apple-system, Segoe UI, Roboto, sans-serif; line-height: 1.55; color: #1a1a1a; }
+  h1 { border-bottom: 2px solid #ddd; padding-bottom: .3rem; margin-top: 2.5rem; }
+  h2 { margin-top: 2rem; }
+  code { background: #f4f4f4; padding: .1rem .3rem; border-radius: 3px; }
+  pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  hr { border: none; border-top: 1px solid #ccc; margin: 3rem 0; }
+  blockquote { border-left: 4px solid #ccc; margin-left: 0; padding-left: 1rem; color: #555; }
+  table { border-collapse: collapse; } td, th { border: 1px solid #ccc; padding: .3rem .6rem; }
+  .artifact-path { color: #888; font-size: .85rem; font-family: monospace; }
+</style>
+EOF
+
+first=true
+for f in "${artifacts[@]}"; do
+  if [ "$first" = true ]; then first=false; else printf '\n\n---\n\n' >> "$combined"; fi
+  rel="${f#"$change_dir"/}"
+  printf '# %s\n\n<p class="artifact-path">%s</p>\n\n' "$rel" "$rel" >> "$combined"
+  cat "$f" >> "$combined"
+  printf '\n' >> "$combined"
+done
+
+pandoc "$combined" -s --toc --toc-depth=2 \
+  --metadata title="OpenSpec preview: $change" \
+  -H "$css" -o "$out"
+
+echo "Rendered $(printf '%s ' "${artifacts[@]##*/}")-> $out"
+
+if command -v xdg-open >/dev/null 2>&1 && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
+  xdg-open "$out" >/dev/null 2>&1 &
+  echo "Opened $out in browser"
+else
+  echo "No display detected; open this file manually: $out"
+fi
