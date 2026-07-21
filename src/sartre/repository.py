@@ -1,11 +1,10 @@
 """``Repository`` facade and the ``AsyncRepository`` wrapper.
 
 ``Repository`` composes a ``Registry`` and a ``Store`` and implements the read
-core (`head`/`resolve`/`open`/`fetch_all`) and the write path (`publish`).
-Multi-file fetches parallelize over a thread pool (blob I/O releases the GIL).
-``AsyncRepository`` offers awaitable equivalents by offloading to a thread.
-
-`SnapshotFS`/`checkout` are deferred to a follow-up change.
+core (`head`/`resolve`/`open`/`fetch_all`/`snapshot_fs`/`checkout`) and the write
+path (`publish`). Multi-file fetches parallelize over a thread pool (blob I/O
+releases the GIL). ``AsyncRepository`` offers awaitable equivalents by offloading
+to a thread.
 """
 
 from __future__ import annotations
@@ -17,7 +16,8 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from sartre.errors import NotFound
+from sartre.errors import NotFound, PathError
+from sartre.fs import SnapshotFS
 from sartre.model import HEAD, Alias, Coordinate, Entry, Head, Ref, Snapshot, Version
 from sartre.paths import check_no_case_collisions, normalize_path
 from sartre.ports import Registry, Store
@@ -59,12 +59,41 @@ class Repository:
         dest = Path(tempfile.mkdtemp(prefix="sartre-open-")) / Path(path).name
         return self._materialize(entry, dest)
 
-    def fetch_all(self, snap: Snapshot, *, max_workers: int = 8) -> Path:
-        """Materialize the whole snapshot to a directory by logical path, in parallel."""
-        root = Path(tempfile.mkdtemp(prefix="sartre-fetch-"))
+    def _layout(self, snap: Snapshot, root: Path, max_workers: int) -> Path:
+        """Materialize every entry under ``root`` by logical path, in parallel.
+
+        Each target is verified to stay within ``root`` (defense in depth — publish
+        already forbids ``..``/absolute paths) before any bytes are written.
+        """
+        base = root.resolve()
+
+        def place(entry: Entry) -> None:
+            dest = (root / entry.path).resolve()
+            if not dest.is_relative_to(base):
+                raise PathError(f"entry {entry.path!r} escapes destination {root}")
+            self._materialize(entry, dest)
+
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            list(pool.map(lambda e: self._materialize(e, root / e.path), snap.entries))
+            list(pool.map(place, snap.entries))
         return root
+
+    def fetch_all(self, snap: Snapshot, *, max_workers: int = 8) -> Path:
+        """Materialize the whole snapshot to a fresh temp directory, in parallel."""
+        root = Path(tempfile.mkdtemp(prefix="sartre-fetch-"))
+        return self._layout(snap, root, max_workers)
+
+    def checkout(self, snap: Snapshot, dest: Path, *, max_workers: int = 8) -> Path:
+        """Materialize the whole snapshot under ``dest`` by logical path, in parallel.
+
+        Files land at their canonical paths under ``dest`` and nothing is written
+        outside it; uncached blobs are fetched concurrently and deduped by the store.
+        """
+        dest.mkdir(parents=True, exist_ok=True)
+        return self._layout(snap, dest, max_workers)
+
+    def snapshot_fs(self, snap: Snapshot) -> SnapshotFS:
+        """A read-only fsspec filesystem bound to ``snap`` and this store."""
+        return SnapshotFS(snap, self.store)
 
     def publish(
         self,
@@ -110,3 +139,6 @@ class AsyncRepository:
 
     async def fetch_all(self, snap: Snapshot, *, max_workers: int = 8) -> Path:
         return await asyncio.to_thread(self._sync.fetch_all, snap, max_workers=max_workers)
+
+    async def checkout(self, snap: Snapshot, dest: Path, *, max_workers: int = 8) -> Path:
+        return await asyncio.to_thread(self._sync.checkout, snap, dest, max_workers=max_workers)
