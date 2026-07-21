@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
@@ -57,6 +58,9 @@ class _RaisingStore:
     def delete(self, content_hash: Hash) -> None:
         raise AssertionError("read-only view")
 
+    def list(self) -> Iterable[Hash]:
+        raise AssertionError("listing must not enumerate blobs")
+
 
 class _CountingRemote:
     """Wraps a Store and counts open() calls (a download probe)."""
@@ -80,6 +84,9 @@ class _CountingRemote:
 
     def delete(self, content_hash: Hash) -> None:
         self.inner.delete(content_hash)
+
+    def list(self) -> Iterable[Hash]:
+        return self.inner.list()
 
 
 def test_listing_served_from_manifest_without_fetch() -> None:

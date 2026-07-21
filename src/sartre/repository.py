@@ -12,13 +12,16 @@ from __future__ import annotations
 import asyncio
 import io
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sartre.errors import NotFound, PathError
+from sartre.errors import Conflict, NotFound, PathError
 from sartre.fs import SnapshotFS
-from sartre.model import HEAD, Alias, Coordinate, Entry, Head, Ref, Snapshot, Version
+from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
+from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
 from sartre.paths import check_no_case_collisions, normalize_path
 from sartre.ports import Registry, Store
 
@@ -27,12 +30,36 @@ def _pointer_ref(pointer: str) -> Ref:
     return Head() if pointer == "head" else Alias(pointer)
 
 
+@dataclass(frozen=True, slots=True)
+class RetentionPolicy:
+    """What GC keeps beyond the always-protected pointers/tags.
+
+    ``keep_last_n`` retains the newest N distinct versions per coordinate (by
+    commit-log order); ``keep_within`` retains versions whose log time is within
+    the duration of ``now``. The default (``0`` / ``None``) keeps only pointers.
+    """
+
+    keep_last_n: int = 0
+    keep_within: timedelta | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GCResult:
+    """What a GC pass reclaimed."""
+
+    dropped_versions: tuple[Version, ...] = field(default_factory=tuple)
+    deleted_blobs: tuple[Hash, ...] = field(default_factory=tuple)
+
+
 class Repository:
     """Composes a :class:`Registry` and a :class:`Store` into the public surface."""
 
-    def __init__(self, registry: Registry, store: Store) -> None:
+    def __init__(
+        self, registry: Registry, store: Store, *, hasher: Hasher = DEFAULT_HASHER
+    ) -> None:
         self.registry = registry
         self.store = store
+        self._hasher = hasher  # pre-hashes payloads so a publish can lease before uploading
 
     def head(self, coord: Coordinate, ref: Ref = HEAD) -> Version:
         return self.registry.head(coord, ref)
@@ -103,23 +130,117 @@ class Repository:
         pointer: str = "head",
         metadata: Mapping[str, object] | None = None,
     ) -> Version:
-        """Full-replacement, fail-fast publish: blobs → manifest → CAS pointer."""
+        """Full-replacement, fail-fast publish: lease → blobs → manifest → CAS pointer.
+
+        The version and blob hashes are derived up front (payloads are pre-hashed),
+        so the publish can hold a lease over ``(version, hashes)`` for its whole
+        duration — a concurrent GC then treats the in-flight blobs as protected and
+        the in-flight version as retained (see the garbage-collection capability).
+        """
         # Canonicalize paths and reject case-collisions up front (write-time path model).
         normalized = {normalize_path(path): data for path, data in files.items()}
         check_no_case_collisions(normalized)
+
+        # Pre-hash to derive entries and the version *before* uploading, so the lease
+        # covers the upload → commit → advance window (store.put re-hashes; idempotent).
+        entries = tuple(
+            Entry(path=path, content_hash=self._hasher.hash(io.BytesIO(data)), size=len(data))
+            for path, data in sorted(normalized.items())
+        )
+        version = manifest_version(entries, self._hasher)
+        hashes = {entry.content_hash for entry in entries}
 
         try:
             start: Version | None = self.registry.head(coord, _pointer_ref(pointer))
         except NotFound:
             start = None  # first publish to this pointer
 
-        entries = tuple(
-            Entry(path=path, content_hash=self.store.put(io.BytesIO(data)), size=len(data))
-            for path, data in sorted(normalized.items())
-        )
-        version = self.registry.commit(coord, entries, dict(metadata or {}))
-        self.registry.set_pointer(coord, pointer, version, expected=start)  # CAS; raises Conflict
-        return version
+        lease = self.registry.acquire_lease(version, hashes)
+        try:
+            for data in normalized.values():
+                self.store.put(io.BytesIO(data))  # blobs first (idempotent, dedup by hash)
+            committed = self.registry.commit(coord, entries, dict(metadata or {}))
+            self.registry.set_pointer(coord, pointer, committed, expected=start)  # CAS
+            return committed
+        finally:
+            self.registry.release_lease(lease)
+
+    # --- garbage collection ---
+
+    def _distinct_log_versions(self, coord: Coordinate) -> list[Version]:
+        seen: dict[Version, None] = {}  # newest-last, deduped
+        for entry in self.registry.list_log(coord):
+            seen[entry.version] = None
+        return list(seen)
+
+    def _retained_versions(self, policy: RetentionPolicy, now: datetime) -> set[Version]:
+        """Versions protected from dropping: pointers/tags + keep_last_n + keep_within + leases."""
+        retained: set[Version] = set(self.registry.active_leased_versions())
+        for coord in self.registry.list_coordinates():
+            retained.update(self.registry.list_pointers(coord).values())
+            log = self.registry.list_log(coord)
+            distinct = self._distinct_log_versions(coord)
+            if policy.keep_last_n:
+                retained.update(distinct[-policy.keep_last_n :])
+            if policy.keep_within is not None:
+                cutoff = now - policy.keep_within
+                retained.update(e.version for e in log if e.created_at >= cutoff)
+        return retained
+
+    def _live_blobs(self) -> set[Hash]:
+        """Blobs reachable from every resolvable version now, plus leased hashes."""
+        live: set[Hash] = set(self.registry.active_leased_hashes())
+        for coord in self.registry.list_coordinates():
+            for version in self._distinct_log_versions(coord):
+                snap = self.registry.resolve(coord, Pin(version))
+                live.update(entry.content_hash for entry in snap.entries)
+        return live
+
+    def gc(
+        self, policy: RetentionPolicy | None = None, *, clock: Callable[[], datetime] | None = None
+    ) -> GCResult:
+        """Mark-and-sweep unreferenced blobs and out-of-retention manifests.
+
+        Mark bounds the candidate sets; the sweep RE-VALIDATES against current state
+        before deleting (a blob marked sweepable can be reused under a fresh lease in
+        the mark→sweep window — verified necessary by the GC TLA+ model). Idempotent
+        and interrupt-safe. ``clock`` (default: ``datetime.now(UTC)``) drives
+        ``keep_within`` and is injectable for deterministic tests.
+        """
+        policy = policy or RetentionPolicy()
+        now = (clock or (lambda: datetime.now(UTC)))()
+
+        # Mark: candidate manifests to drop and candidate blobs to sweep.
+        retained = self._retained_versions(policy, now)
+        drop_domain = {
+            v
+            for coord in self.registry.list_coordinates()
+            for v in self._distinct_log_versions(coord)
+        }
+        candidate_versions = drop_domain - retained
+        candidate_blobs = set(self.store.list())
+
+        # Sweep, re-validated: drop only versions still unretained now; delete only
+        # blobs referenced by no surviving manifest and no live lease now.
+        dropped: list[Version] = []
+        retained_now = self._retained_versions(policy, now)
+        for version in candidate_versions:
+            if version in retained_now:
+                continue
+            try:
+                self.registry.drop_version(version)
+                dropped.append(version)
+            except Conflict:
+                pass  # became a pointer target between mark and sweep; leave it
+
+        live_now = self._live_blobs()
+        deleted: list[Hash] = []
+        for content_hash in candidate_blobs:
+            if content_hash not in live_now and self.store.has(content_hash):
+                self.store.delete(content_hash)
+                deleted.append(content_hash)
+
+        return GCResult(dropped_versions=tuple(dropped), deleted_blobs=tuple(deleted))
 
 
 class AsyncRepository:
@@ -142,3 +263,8 @@ class AsyncRepository:
 
     async def checkout(self, snap: Snapshot, dest: Path, *, max_workers: int = 8) -> Path:
         return await asyncio.to_thread(self._sync.checkout, snap, dest, max_workers=max_workers)
+
+    async def gc(
+        self, policy: RetentionPolicy | None = None, *, clock: Callable[[], datetime] | None = None
+    ) -> GCResult:
+        return await asyncio.to_thread(self._sync.gc, policy, clock=clock)

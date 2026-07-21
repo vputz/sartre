@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import shutil
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, cast
 
@@ -52,6 +53,12 @@ class FsspecBlobBackend(BlobBackend):
 
     def delete(self, key: str) -> None:
         self.fs.rm(self._path(key))
+
+    def list(self) -> Iterable[str]:
+        if not self.fs.exists(self.root):
+            return
+        for path in self.fs.ls(self.root, detail=False):
+            yield str(path).rsplit("/", 1)[-1]  # basename == key (hashes carry no '/')
 
 
 class CasStore(Store):
@@ -93,6 +100,9 @@ class CasStore(Store):
 
     def delete(self, content_hash: Hash) -> None:
         self.backend.delete(content_hash)
+
+    def list(self) -> Iterable[Hash]:
+        return self.backend.list()
 
 
 class CachingStore(Store):
@@ -140,3 +150,6 @@ class CachingStore(Store):
             self.local.delete(content_hash)
         if self.remote.has(content_hash):
             self.remote.delete(content_hash)
+
+    def list(self) -> Iterable[Hash]:
+        return self.remote.list()  # remote is the source of truth; local is a subset

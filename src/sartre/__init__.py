@@ -40,8 +40,8 @@ from sartre.model import (
     Version,
 )
 from sartre.paths import check_no_case_collisions, normalize_path
-from sartre.ports import BlobBackend, Registry, Store
-from sartre.repository import AsyncRepository, Repository
+from sartre.ports import BlobBackend, LeaseId, LogEntry, Registry, Store
+from sartre.repository import AsyncRepository, GCResult, Repository, RetentionPolicy
 from sartre.store import CachingStore, CasStore, FsspecBlobBackend
 
 __all__ = [
@@ -56,10 +56,13 @@ __all__ = [
     "Coordinate",
     "Entry",
     "FsspecBlobBackend",
+    "GCResult",
     "Hash",
     "Hasher",
     "Head",
     "IntegrityError",
+    "LeaseId",
+    "LogEntry",
     "MemoryRegistry",
     "NotFound",
     "PathError",
@@ -67,6 +70,7 @@ __all__ = [
     "Ref",
     "Registry",
     "Repository",
+    "RetentionPolicy",
     "SartreError",
     "Sha256Hasher",
     "Snapshot",

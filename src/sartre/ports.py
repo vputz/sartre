@@ -11,11 +11,25 @@ expressible in the signatures, so they live here as documented invariants.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence, Set
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol, runtime_checkable
+from typing import Any, BinaryIO, NewType, Protocol, runtime_checkable
 
 from sartre.model import HEAD, Coordinate, Entry, Hash, Ref, Snapshot, Version
+
+LeaseId = NewType("LeaseId", int)
+"""Opaque token identifying a live lease (see :meth:`Registry.acquire_lease`)."""
+
+
+@dataclass(frozen=True, slots=True)
+class LogEntry:
+    """One commit-log row: a version that became a tip, with its order and time."""
+
+    version: Version
+    seq: int
+    created_at: datetime
 
 
 @runtime_checkable
@@ -76,6 +90,53 @@ class Registry(Protocol):
         """
         ...
 
+    # --- enumeration & lifecycle (for garbage collection) ---
+
+    def list_coordinates(self) -> Sequence[Coordinate]:
+        """Return every coordinate the registry holds (repo-wide root discovery)."""
+        ...
+
+    def list_log(self, coord: Coordinate) -> Sequence[LogEntry]:
+        """Return the coordinate's commit log in sequence order (oldest first).
+
+        Each :class:`LogEntry` carries ``(version, seq, created_at)``, so a garbage
+        collector can apply ``keep_last_n`` (by order) and ``keep_within`` (by time).
+        """
+        ...
+
+    def drop_version(self, version: Version) -> None:
+        """Remove a manifest record that retention no longer wants (repo-wide).
+
+        Contract: manifests are global and content-addressed (a version may be
+        shared across coordinates by promotion), so this is repository-wide. It
+        MUST raise :class:`~sartre.errors.Conflict` if the version is the current
+        target of any pointer in any coordinate; otherwise it prunes the version
+        from every coordinate's log and removes the manifest record. Idempotent:
+        dropping an absent version is a no-op.
+        """
+        ...
+
+    def acquire_lease(self, version: Version, hashes: Set[Hash]) -> LeaseId:
+        """Claim a version and its blob hashes as GC roots for an in-flight write.
+
+        Contract: a lease is not a lock — it grants no exclusive access. While held,
+        the version appears in :meth:`active_leased_versions` and the hashes in
+        :meth:`active_leased_hashes`, so a concurrent GC treats them as roots.
+        """
+        ...
+
+    def release_lease(self, lease_id: LeaseId) -> None:
+        """Release a lease. Idempotent: releasing an unknown lease is a no-op."""
+        ...
+
+    def active_leased_hashes(self) -> Set[Hash]:
+        """The union of blob hashes under all live leases."""
+        ...
+
+    def active_leased_versions(self) -> Set[Version]:
+        """The union of versions under all live leases."""
+        ...
+
 
 @runtime_checkable
 class Store(Protocol):
@@ -106,6 +167,10 @@ class Store(Protocol):
         """Remove a blob by content hash (for garbage collection)."""
         ...
 
+    def list(self) -> Iterable[Hash]:
+        """Enumerate the content hashes of all stored blobs (the GC sweep domain)."""
+        ...
+
 
 @runtime_checkable
 class BlobBackend(Protocol):
@@ -130,4 +195,8 @@ class BlobBackend(Protocol):
 
     def delete(self, key: str) -> None:
         """Remove ``key``."""
+        ...
+
+    def list(self) -> Iterable[str]:
+        """Enumerate all stored keys (surfaced by ``CasStore.list`` as content hashes)."""
         ...

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import BinaryIO
 
@@ -78,6 +78,9 @@ class _CountingStore:
 
     def delete(self, content_hash: Hash) -> None:
         self.inner.delete(content_hash)
+
+    def list(self) -> Iterable[Hash]:
+        return self.inner.list()
 
 
 def test_concurrent_fetch_downloads_once(make_store: Callable[[], CasStore]) -> None:

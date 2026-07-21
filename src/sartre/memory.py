@@ -11,14 +11,15 @@ transactional backend. Suitable for tests and local use; nothing is persisted.
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from sartre.errors import Conflict, NotFound
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
-from sartre.model import HEAD, Alias, Coordinate, Entry, Head, Pin, Ref, Snapshot, Version
+from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
+from sartre.ports import LeaseId, LogEntry
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,8 @@ class MemoryRegistry:
         self._hasher = hasher
         self._manifests: dict[Version, _ManifestRecord] = {}
         self._coords: dict[tuple[str, str], _CoordState] = {}
+        self._leases: dict[LeaseId, tuple[Version, frozenset[Hash]]] = {}
+        self._next_lease = 0
         self._lock = threading.Lock()
 
     # --- helpers (call under self._lock) ---
@@ -140,3 +143,45 @@ class MemoryRegistry:
                 )
             )
             state.next_seq += 1
+
+    # --- enumeration & lifecycle (garbage collection) ---
+
+    def list_coordinates(self) -> Sequence[Coordinate]:
+        with self._lock:
+            return [Coordinate(name, env) for (name, env) in self._coords]
+
+    def list_log(self, coord: Coordinate) -> Sequence[LogEntry]:
+        with self._lock:
+            return [
+                LogEntry(version=e.version, seq=e.seq, created_at=e.created_at)
+                for e in self._state(coord).log
+            ]
+
+    def drop_version(self, version: Version) -> None:
+        with self._lock:
+            for (name, env), state in self._coords.items():
+                if version in state.pointers.values():
+                    coord = Coordinate(name, env)
+                    raise Conflict(f"cannot drop {version}: still a pointer target of {coord}")
+            for state in self._coords.values():  # prune from every coordinate's log
+                state.log = [e for e in state.log if e.version != version]
+            self._manifests.pop(version, None)  # idempotent
+
+    def acquire_lease(self, version: Version, hashes: Set[Hash]) -> LeaseId:
+        with self._lock:
+            lease_id = LeaseId(self._next_lease)
+            self._next_lease += 1
+            self._leases[lease_id] = (version, frozenset(hashes))
+            return lease_id
+
+    def release_lease(self, lease_id: LeaseId) -> None:
+        with self._lock:
+            self._leases.pop(lease_id, None)  # idempotent
+
+    def active_leased_hashes(self) -> set[Hash]:
+        with self._lock:
+            return {h for _version, hashes in self._leases.values() for h in hashes}
+
+    def active_leased_versions(self) -> set[Version]:
+        with self._lock:
+            return {version for version, _hashes in self._leases.values()}
