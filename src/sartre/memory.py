@@ -58,7 +58,12 @@ class MemoryRegistry:
     # --- helpers (call under self._lock) ---
 
     def _state(self, coord: Coordinate) -> _CoordState:
+        """Get-or-create — for write paths that legitimately materialize a coordinate."""
         return self._coords.setdefault((coord.name, coord.env), _CoordState())
+
+    def _peek(self, coord: Coordinate) -> _CoordState | None:
+        """Read-only lookup — never materializes an empty coordinate."""
+        return self._coords.get((coord.name, coord.env))
 
     def _pointer_name(self, ref: Ref) -> str:
         if isinstance(ref, Head):
@@ -68,7 +73,9 @@ class MemoryRegistry:
         raise TypeError(f"not a pointer ref: {ref!r}")
 
     def _resolve_ref(self, coord: Coordinate, ref: Ref) -> Version:
-        state = self._state(coord)
+        state = self._peek(coord)
+        if state is None:
+            raise NotFound(f"nothing published for {coord}")
         if isinstance(ref, Pin):
             if ref.version not in {e.version for e in state.log}:
                 raise NotFound(f"version {ref.version} not known for {coord}")
@@ -98,12 +105,14 @@ class MemoryRegistry:
 
     def list_pointers(self, coord: Coordinate) -> Mapping[str, Version]:
         with self._lock:
-            return dict(self._state(coord).pointers)
+            state = self._peek(coord)
+            return dict(state.pointers) if state else {}
 
     def list_versions(self, coord: Coordinate) -> Sequence[Version]:
         with self._lock:
+            state = self._peek(coord)
             seen: dict[Version, None] = {}  # distinct versions in commit-log order
-            for entry in self._state(coord).log:
+            for entry in state.log if state else ():
                 seen.setdefault(entry.version, None)
             return list(seen)
 
@@ -127,12 +136,13 @@ class MemoryRegistry:
         with self._lock:
             if version not in self._manifests:
                 raise NotFound(f"cannot point at uncommitted version {version}")
-            state = self._state(coord)
-            current = state.pointers.get(name)
+            existing = self._peek(coord)  # don't materialize the coord on a conflict
+            current = existing.pointers.get(name) if existing else None
             if current != expected:
                 raise Conflict(
                     f"pointer {name!r} for {coord} is {current}, expected {expected}"
                 )
+            state = self._state(coord)  # committing to write → now materialize
             state.pointers[name] = version
             state.log.append(
                 _LogEntry(
@@ -152,9 +162,10 @@ class MemoryRegistry:
 
     def list_log(self, coord: Coordinate) -> Sequence[LogEntry]:
         with self._lock:
+            state = self._peek(coord)
             return [
                 LogEntry(version=e.version, seq=e.seq, created_at=e.created_at)
-                for e in self._state(coord).log
+                for e in (state.log if state else ())
             ]
 
     def drop_version(self, version: Version) -> None:

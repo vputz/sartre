@@ -26,6 +26,7 @@ from sartre.hashing import (
     manifest_version,
     parse_key,
 )
+from sartre.local import open_local
 from sartre.memory import MemoryRegistry
 from sartre.model import (
     HEAD,
@@ -42,6 +43,7 @@ from sartre.model import (
 from sartre.paths import check_no_case_collisions, normalize_path
 from sartre.ports import BlobBackend, LeaseId, LogEntry, Registry, Store
 from sartre.repository import AsyncRepository, GCResult, Repository, RetentionPolicy
+from sartre.sqlite import SqliteRegistry
 from sartre.store import CachingStore, CasStore, FsspecBlobBackend
 
 __all__ = [
@@ -75,6 +77,7 @@ __all__ = [
     "Sha256Hasher",
     "Snapshot",
     "SnapshotFS",
+    "SqliteRegistry",
     "Store",
     "Version",
     "algorithm_of",
@@ -83,5 +86,6 @@ __all__ = [
     "make_key",
     "manifest_version",
     "normalize_path",
+    "open_local",
     "parse_key",
 ]
