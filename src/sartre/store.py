@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import shutil
 import threading
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, cast
@@ -29,7 +30,15 @@ if TYPE_CHECKING:
 
 
 class FsspecBlobBackend(BlobBackend):
-    """A dumb :class:`BlobBackend` over any fsspec filesystem rooted at a prefix."""
+    """A dumb :class:`BlobBackend` over any fsspec filesystem rooted at a prefix.
+
+    ``put`` is crash-safe: bytes are staged under a reserved ``{root}/.tmp/``
+    namespace and renamed onto the final key, so a blob appears at its key only
+    once fully written. ``list`` excludes that namespace; ``sweep_temp`` reclaims
+    staging objects orphaned by a crashed ``put``.
+    """
+
+    _TEMP_DIR = ".tmp"
 
     def __init__(self, fs: AbstractFileSystem, root: str) -> None:
         self.fs = fs
@@ -38,6 +47,13 @@ class FsspecBlobBackend(BlobBackend):
     def _path(self, key: str) -> str:
         return f"{self.root}/{key}"
 
+    @property
+    def _temp_root(self) -> str:
+        return f"{self.root}/{self._TEMP_DIR}"
+
+    def _staging_path(self) -> str:
+        return f"{self._temp_root}/{uuid.uuid4().hex}"
+
     def get(self, key: str) -> BinaryIO:
         if not self.exists(key):
             raise NotFound(f"blob not found: {key}")
@@ -45,8 +61,18 @@ class FsspecBlobBackend(BlobBackend):
         return cast(BinaryIO, self.fs.open(self._path(key), "rb"))
 
     def put(self, key: str, data: BinaryIO) -> None:
-        with cast(BinaryIO, self.fs.open(self._path(key), "wb")) as handle:
-            shutil.copyfileobj(data, handle)
+        if self.exists(key):  # content-addressed: identical bytes already stored
+            return
+        self.fs.makedirs(self._temp_root, exist_ok=True)
+        staging = self._staging_path()
+        try:
+            with cast(BinaryIO, self.fs.open(staging, "wb")) as handle:
+                shutil.copyfileobj(data, handle)
+            # Publish atomically: the blob appears at its key only now, whole.
+            self.fs.mv(staging, self._path(key))
+        finally:
+            if self.fs.exists(staging):  # best-effort cleanup on failure
+                self.fs.rm(staging)
 
     def exists(self, key: str) -> bool:
         return bool(self.fs.exists(self._path(key)))
@@ -58,7 +84,18 @@ class FsspecBlobBackend(BlobBackend):
         if not self.fs.exists(self.root):
             return
         for path in self.fs.ls(self.root, detail=False):
-            yield str(path).rsplit("/", 1)[-1]  # basename == key (hashes carry no '/')
+            name = str(path).rsplit("/", 1)[-1]  # basename == key (hashes carry no '/')
+            if not name.startswith("."):  # skip the reserved .tmp namespace
+                yield name
+
+    def sweep_temp(self) -> int:
+        """Delete staging objects orphaned by crashed puts; return the count reclaimed."""
+        if not self.fs.exists(self._temp_root):
+            return 0
+        staged = list(self.fs.ls(self._temp_root, detail=False))
+        for path in staged:
+            self.fs.rm(path)
+        return len(staged)
 
 
 class CasStore(Store):
