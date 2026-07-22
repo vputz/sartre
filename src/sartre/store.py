@@ -12,7 +12,7 @@ backend is a later optimization.
 
 from __future__ import annotations
 
-import io
+import hashlib
 import shutil
 import threading
 import uuid
@@ -22,9 +22,37 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
 from sartre.errors import IntegrityError, NotFound
-from sartre.hashing import DEFAULT_HASHER, Hasher, algorithm_of, hasher_for
+from sartre.hashing import DEFAULT_HASHER, Hasher, algorithm_of, hasher_for, make_key
 from sartre.model import Hash
 from sartre.ports import BlobBackend, Store
+
+
+class _HashingReader:
+    """A read-through tee: wraps a readable stream and hashes bytes as they are read.
+
+    The backend's copy loop pulls bytes through this wrapper, so the content hash falls
+    out of the same single streaming pass that writes staging (put) or fills a
+    destination (verified read) — no whole-blob buffer. After the inner stream is
+    exhausted, :meth:`key` is the content hash and :meth:`length` the byte count.
+    """
+
+    def __init__(self, inner: BinaryIO, hasher: Hasher) -> None:
+        self._inner = inner
+        self._algorithm = hasher.algorithm
+        self._digest = hashlib.new(hasher.algorithm)
+        self._length = 0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._inner.read(size)
+        self._digest.update(chunk)
+        self._length += len(chunk)
+        return chunk
+
+    def key(self) -> Hash:
+        return cast(Hash, make_key(self._algorithm, self._digest.hexdigest()))
+
+    def length(self) -> int:
+        return self._length
 
 if TYPE_CHECKING:
     from fsspec import AbstractFileSystem
@@ -47,10 +75,11 @@ def _as_epoch(value: Any) -> float | None:
 class FsspecBlobBackend(BlobBackend):
     """A dumb :class:`BlobBackend` over any fsspec filesystem rooted at a prefix.
 
-    ``put`` is crash-safe: bytes are staged under a reserved ``{root}/.tmp/``
-    namespace and renamed onto the final key, so a blob appears at its key only
-    once fully written. ``list`` excludes that namespace; ``sweep_temp`` reclaims
-    staging objects orphaned by a crashed ``put``.
+    Writes are crash-safe and streaming: ``stage`` streams bytes into a reserved
+    ``{root}/.tmp/`` namespace, and ``promote`` atomically renames the staged object
+    onto its final key, so a blob appears at its key only once fully written. ``list``
+    excludes that namespace; ``sweep_temp`` reclaims staging objects orphaned by a
+    crashed write.
     """
 
     _TEMP_DIR = ".tmp"
@@ -66,8 +95,8 @@ class FsspecBlobBackend(BlobBackend):
     def _temp_root(self) -> str:
         return f"{self.root}/{self._TEMP_DIR}"
 
-    def _staging_path(self) -> str:
-        return f"{self._temp_root}/{uuid.uuid4().hex}"
+    def _staging_key(self) -> str:
+        return f"{self._TEMP_DIR}/{uuid.uuid4().hex}"  # a key under the .tmp namespace
 
     def get(self, key: str) -> BinaryIO:
         if not self.exists(key):
@@ -75,19 +104,24 @@ class FsspecBlobBackend(BlobBackend):
         # fsspec types open() loosely; "rb"/"wb" are binary at runtime.
         return cast(BinaryIO, self.fs.open(self._path(key), "rb"))
 
-    def put(self, key: str, data: BinaryIO) -> None:
-        if self.exists(key):  # content-addressed: identical bytes already stored
-            return
+    def stage(self, data: BinaryIO) -> str:
+        """Stream ``data`` to a fresh staging key and return it. Bounded memory."""
         self.fs.makedirs(self._temp_root, exist_ok=True)
-        staging = self._staging_path()
-        try:
-            with cast(BinaryIO, self.fs.open(staging, "wb")) as handle:
-                shutil.copyfileobj(data, handle)
-            # Publish atomically: the blob appears at its key only now, whole.
-            self.fs.mv(staging, self._path(key))
-        finally:
-            if self.fs.exists(staging):  # best-effort cleanup on failure
-                self.fs.rm(staging)
+        staging_key = self._staging_key()
+        with cast(BinaryIO, self.fs.open(self._path(staging_key), "wb")) as handle:
+            shutil.copyfileobj(data, handle)  # chunked copy; never buffers the whole blob
+        return staging_key
+
+    def promote(self, staging_key: str, final_key: str) -> None:
+        """Atomically make the staged bytes appear at ``final_key``; idempotent.
+
+        If ``final_key`` already exists (identical content, e.g. a concurrent writer
+        won the race), the staged object is discarded rather than overwritten.
+        """
+        if self.exists(final_key):
+            self.fs.rm(self._path(staging_key))
+        else:
+            self.fs.mv(self._path(staging_key), self._path(final_key))
 
     def exists(self, key: str) -> bool:
         return bool(self.fs.exists(self._path(key)))
@@ -137,27 +171,43 @@ class CasStore(Store):
         return self.backend.exists(content_hash)
 
     def put(self, data: BinaryIO) -> Hash:
-        payload = data.read()
-        key = self.hasher.hash(io.BytesIO(payload))
-        if not self.backend.exists(key):  # idempotent: identical bytes are a no-op
-            self.backend.put(key, io.BytesIO(payload))
+        """Stream ``data`` to the backend and return its content hash. Bounded memory.
+
+        The hash is unknown until the bytes are read, so a hashing tee rides the single
+        streaming pass into staging; ``promote`` then names the blob by its hash (and
+        discards the staging object when identical content is already present).
+        """
+        reader = _HashingReader(data, self.hasher)
+        staging_key = self.backend.stage(cast(BinaryIO, reader))  # only .read() is used
+        key = reader.key()
+        self.backend.promote(staging_key, key)
         return key
 
-    def _load(self, content_hash: Hash) -> bytes:
-        payload = self.backend.get(content_hash).read()
-        if self.verify:
-            actual = hasher_for(algorithm_of(content_hash)).hash(io.BytesIO(payload))
-            if actual != content_hash:
-                raise IntegrityError(
-                    f"blob {content_hash} failed verification (got {actual})"
-                )
-        return payload
-
     def open(self, content_hash: Hash) -> BinaryIO:
-        return io.BytesIO(self._load(content_hash))
+        """Return a seekable handle for random access — NOT verified per read.
+
+        A partial/seek read cannot be checked against a whole-blob content hash, so this
+        serves the backend's native handle directly (range reads on a remote backend).
+        Callers needing verified bytes use :meth:`get_to` (verified whole-blob) or a
+        :class:`CachingStore` (verified on local materialization).
+        """
+        return self.backend.get(content_hash)
 
     def get_to(self, content_hash: Hash, dest: Path) -> Path:
-        dest.write_bytes(self._load(content_hash))
+        """Materialize the whole blob to ``dest``, verifying integrity as it streams.
+
+        Hashes while copying and, at end-of-stream, deletes ``dest`` and raises
+        :class:`IntegrityError` if the bytes do not hash to ``content_hash``.
+        """
+        verifier = hasher_for(algorithm_of(content_hash))
+        reader = _HashingReader(self.backend.get(content_hash), verifier)
+        with dest.open("wb") as out:
+            shutil.copyfileobj(reader, out)
+        if self.verify and reader.key() != content_hash:
+            dest.unlink(missing_ok=True)
+            raise IntegrityError(
+                f"blob {content_hash} failed verification (got {reader.key()})"
+            )
         return dest
 
     def delete(self, content_hash: Hash) -> None:
@@ -189,9 +239,21 @@ class CachingStore(Store):
             return self._locks.setdefault(content_hash, threading.Lock())
 
     def _ensure_local(self, content_hash: Hash) -> None:
+        """Materialize the blob into ``local``, verifying it on the way in.
+
+        Streams the (unverified) remote handle into ``local.put``, which re-hashes; if
+        the result does not match the requested hash the misfiled blob is removed and an
+        integrity error is raised. So a subsequent seek is served from a verified local
+        copy — this is what makes a `CachingStore` the verified random-access path.
+        """
         with self._lock_for(content_hash):
             if not self.local.has(content_hash):
-                self.local.put(self.remote.open(content_hash))
+                got = self.local.put(self.remote.open(content_hash))
+                if got != content_hash:
+                    self.local.delete(got)
+                    raise IntegrityError(
+                        f"blob {content_hash} failed verification (got {got})"
+                    )
 
     def has(self, content_hash: Hash) -> bool:
         return self.local.has(content_hash) or self.remote.has(content_hash)
@@ -205,10 +267,10 @@ class CachingStore(Store):
         return self.local.get_to(content_hash, dest)
 
     def put(self, data: BinaryIO) -> Hash:
-        payload = data.read()
-        key = self.remote.put(io.BytesIO(payload))  # remote is the source of truth
-        self.local.put(io.BytesIO(payload))  # populate the cache write-through
-        return key
+        # Stream to remote (the source of truth) in bounded memory; the local cache is
+        # populated lazily on first read (see _ensure_local), so a large publish does not
+        # re-download its own blob just to warm the cache.
+        return self.remote.put(data)
 
     def delete(self, content_hash: Hash) -> None:
         if self.local.has(content_hash):

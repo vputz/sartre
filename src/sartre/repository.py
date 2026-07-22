@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import BinaryIO
 
 from sartre.errors import Conflict, LeaseExpired, NotFound, PathError
 from sartre.fs import SnapshotFS
@@ -29,6 +30,15 @@ from sartre.ports import DEFAULT_LEASE_TTL, Registry, Store
 
 def _pointer_ref(pointer: str) -> Ref:
     return Head() if pointer == "head" else Alias(pointer)
+
+
+def _source_stream(src: bytes | Path) -> BinaryIO:
+    """Open a fresh readable stream for a publish source (re-readable — see `publish`)."""
+    return io.BytesIO(src) if isinstance(src, bytes) else src.open("rb")
+
+
+def _source_size(src: bytes | Path) -> int:
+    return len(src) if isinstance(src, bytes) else src.stat().st_size
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,34 +146,46 @@ class Repository:
         """A read-only fsspec filesystem bound to ``snap`` and this store."""
         return SnapshotFS(snap, self.store)
 
+    def _hash_source(self, src: bytes | Path) -> Hash:
+        """Stream a publish source through the hasher in bounded memory (pass 1)."""
+        with _source_stream(src) as stream:
+            return self._hasher.hash(stream)
+
     def publish(
         self,
         coord: Coordinate,
-        files: Mapping[str, bytes],
+        files: Mapping[str, bytes | Path],
         *,
         pointer: str = "head",
         metadata: Mapping[str, object] | None = None,
     ) -> Version:
-        """Full-replacement, fail-fast publish: lease → blobs → manifest → CAS pointer.
+        """Full-replacement, fail-fast publish: hash → lease → blobs → manifest → CAS.
 
-        The version and blob hashes are derived up front (payloads are pre-hashed), so the
-        publish holds a lease over ``(version, hashes)`` before uploading — a concurrent GC
-        treats the in-flight blobs as protected and the in-flight version as retained. A
-        background heartbeat renews the lease within its ttl (liveness); and — the
-        safety-critical step — the lease is re-verified live immediately before ``commit``
-        and again before the pointer CAS, aborting with :class:`LeaseExpired` (retryable)
-        if it lapsed, so a manifest is never committed or pointed over blobs GC may have
-        reclaimed. See the repository-facade and garbage-collection capabilities.
+        ``files`` maps logical paths to re-readable sources — in-memory ``bytes`` or a
+        ``Path`` to a file on disk (not read-once streams). Each source is read twice,
+        both times streamed in bounded memory: pass 1 streams it through the hasher to
+        derive its content hash (so a lease over ``(version, hashes)`` can be held before
+        uploading — a concurrent GC then treats the in-flight blobs as protected and the
+        version as retained), pass 2 streams it through ``store.put``. A background
+        heartbeat renews the lease within its ttl (liveness); and — the safety-critical
+        step — the lease is re-verified live immediately before ``commit`` and again
+        before the pointer CAS, aborting with :class:`LeaseExpired` (retryable) if it
+        lapsed. See the repository-facade and garbage-collection capabilities.
         """
         # Canonicalize paths and reject case-collisions up front (write-time path model).
-        normalized = {normalize_path(path): data for path, data in files.items()}
+        normalized = {normalize_path(path): src for path, src in files.items()}
         check_no_case_collisions(normalized)
 
-        # Pre-hash to derive entries and the version *before* uploading, so the lease
-        # covers the upload → commit → advance window (store.put re-hashes; idempotent).
+        # Pass 1 — stream each source through the hasher to derive entries and the version
+        # *before* uploading, so the lease covers the upload → commit → advance window.
+        # Sources are re-readable, so pass 2 re-opens them to upload (no whole-blob buffer).
         entries = tuple(
-            Entry(path=path, content_hash=self._hasher.hash(io.BytesIO(data)), size=len(data))
-            for path, data in sorted(normalized.items())
+            Entry(
+                path=path,
+                content_hash=self._hash_source(src),
+                size=_source_size(src),
+            )
+            for path, src in sorted(normalized.items())
         )
         version = manifest_version(entries, self._hasher)
         hashes = {entry.content_hash for entry in entries}
@@ -186,8 +208,9 @@ class Repository:
         beat = threading.Thread(target=_heartbeat, name="sartre-lease-heartbeat", daemon=True)
         beat.start()
         try:
-            for data in normalized.values():
-                self.store.put(io.BytesIO(data))  # blobs first (idempotent, dedup by hash)
+            for src in normalized.values():  # pass 2: stream each source to the store
+                with _source_stream(src) as stream:
+                    self.store.put(stream)  # streaming stage+promote (idempotent, dedup by hash)
             if not self.registry.renew_lease(lease, self._lease_ttl):  # self-check before commit
                 raise LeaseExpired("publish lease lapsed before commit; retry")
             committed = self.registry.commit(coord, entries, dict(metadata or {}))

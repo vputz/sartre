@@ -174,7 +174,14 @@ class Store(Protocol):
         ...
 
     def open(self, content_hash: Hash) -> BinaryIO:
-        """Open a blob for streaming reads, verifying integrity on download."""
+        """Open a blob for seekable, random-access reads.
+
+        Contract: returns a seekable handle for random access (e.g. a parquet-footer
+        seek). This handle is NOT integrity-verified per read — a partial read cannot be
+        checked against a whole-blob content hash. Verified bytes come from
+        :meth:`get_to` (whole-blob) or from a :class:`~sartre.store.CachingStore`
+        (verified on local materialization).
+        """
         ...
 
     def get_to(self, content_hash: Hash, dest: Path) -> Path:
@@ -213,11 +220,26 @@ class BlobBackend(Protocol):
     """
 
     def get(self, key: str) -> BinaryIO:
-        """Open the value stored at ``key`` for streaming reads."""
+        """Open the value stored at ``key`` for seekable, streaming reads."""
         ...
 
-    def put(self, key: str, data: BinaryIO) -> None:
-        """Store ``data`` at ``key``."""
+    def stage(self, data: BinaryIO) -> str:
+        """Stream ``data`` to a reserved staging key and return it.
+
+        Contract: the single write entry point — there is no key-first ``put`` (a
+        content-addressed writer does not know the key until the bytes are hashed).
+        ``stage`` MUST consume ``data`` incrementally (bounded memory) and MUST NOT make
+        the bytes visible at any content key; they appear only after :meth:`promote`.
+        """
+        ...
+
+    def promote(self, staging_key: str, final_key: str) -> None:
+        """Atomically make the staged bytes appear at ``final_key``.
+
+        Contract: a blob appears at ``final_key`` only once fully written (a rename, not
+        a copy-in-place). Idempotent: if ``final_key`` already exists (identical content),
+        the staged object is discarded rather than overwritten.
+        """
         ...
 
     def exists(self, key: str) -> bool:

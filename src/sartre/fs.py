@@ -104,8 +104,10 @@ class SnapshotFS(AbstractFileSystem):
             if path in self._dirs:
                 raise IsADirectoryError(path)
             raise FileNotFoundError(path)
-        # The CAS store returns a seekable, integrity-verified handle; return it
-        # directly rather than layering fsspec's block-cache — the CAS is the cache.
+        # The store returns a seekable handle for random access; return it directly
+        # rather than layering fsspec's block-cache. It is NOT integrity-verified per
+        # read (a partial/seek read can't be checked against a whole-blob hash); back
+        # the filesystem with a CachingStore for verified-on-materialization seeks.
         return self.store.open(entry.content_hash)
 
     def _rm(self, path: str) -> None:

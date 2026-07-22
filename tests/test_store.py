@@ -67,16 +67,21 @@ def test_missing_blob_raises_not_found(make_store: Callable[[], CasStore]) -> No
         store.open("sha256:" + "0" * 64)
 
 
-def test_corrupted_blob_fails_verification(make_store: Callable[[], CasStore]) -> None:
+def test_corrupted_blob_fails_verification(
+    make_store: Callable[[], CasStore], tmp_path: Path
+) -> None:
     store = make_store()
     key = store.put(io.BytesIO(b"trustworthy"))
-    # Corrupt the stored bytes directly via the filesystem (backend.put is now
-    # idempotent and would no-op on an existing key).
+    # Corrupt the stored bytes directly via the filesystem.
     backend = cast(FsspecBlobBackend, store.backend)
     with cast(BinaryIO, backend.fs.open(backend._path(key), "wb")) as handle:
         handle.write(b"tampered!!")
+    # Honest split: whole-blob materialization (get_to) verifies and rejects...
     with pytest.raises(IntegrityError):
-        store.open(key)
+        store.get_to(key, tmp_path / "out.bin")
+    assert not (tmp_path / "out.bin").exists()  # partial dest removed
+    # ...but a random-access open() serves the (corrupt) bytes unverified.
+    assert store.open(key).read() == b"tampered!!"
 
 
 def test_caching_store_reuses_local_without_remote(make_store: Callable[[], CasStore]) -> None:
@@ -142,24 +147,24 @@ def test_concurrent_fetch_downloads_once(make_store: Callable[[], CasStore]) -> 
 # --- atomic blob writes ---
 
 
-def test_failed_put_leaves_no_partial_blob() -> None:
+def test_failed_stage_leaves_no_partial_blob() -> None:
     backend = _fresh_backend()
     key = "sha256:" + "a" * 64  # opaque key at the backend level
     with pytest.raises(RuntimeError):
-        backend.put(key, _ExplodingReader(b"partial-payload-bytes"))
-    assert not backend.exists(key)  # no partial blob at the hash
+        backend.stage(_ExplodingReader(b"partial-payload-bytes"))  # explodes mid-write
+    assert not backend.exists(key)  # nothing was promoted; no blob at the hash
     assert key not in set(backend.list())
-    assert backend.sweep_temp() == 0  # finally cleaned the staging object
+    assert backend.sweep_temp() == 1  # the partial staging object is a reclaimable orphan
 
-    backend.put(key, io.BytesIO(b"whole"))  # a subsequent good put works
+    backend.promote(backend.stage(io.BytesIO(b"whole")), key)  # a subsequent good write works
     assert backend.get(key).read() == b"whole"
 
 
 def test_list_excludes_temp_and_sweep_reclaims_orphans() -> None:
     backend = _fresh_backend()
     key = "sha256:" + "b" * 64
-    backend.put(key, io.BytesIO(b"real"))
-    # Plant an orphan staging object (a put that crashed before its rename).
+    backend.promote(backend.stage(io.BytesIO(b"real")), key)
+    # Plant an orphan staging object (a write that crashed before its promote).
     backend.fs.makedirs(backend._temp_root, exist_ok=True)
     orphan = f"{backend._temp_root}/{uuid.uuid4().hex}"
     with cast(BinaryIO, backend.fs.open(orphan, "wb")) as handle:
@@ -198,16 +203,15 @@ def test_no_partial_blob_invariant(ops: list[tuple[bytes, bool]]) -> None:
     succeeded: set[str] = set()
     for payload, should_fail in ops:
         key = DEFAULT_HASHER.hash(io.BytesIO(payload))
-        if should_fail and key not in succeeded:
-            with pytest.raises(RuntimeError):  # absent key: the failing put raises
-                backend.put(key, _ExplodingReader(payload))
-        elif should_fail:
-            backend.put(key, _ExplodingReader(payload))  # present key: idempotent no-op
+        if should_fail:  # a write that explodes mid-stream never promotes → no blob at key
+            with pytest.raises(RuntimeError):
+                backend.stage(_ExplodingReader(payload))
         else:
-            backend.put(key, io.BytesIO(payload))
+            backend.promote(backend.stage(io.BytesIO(payload)), key)
             succeeded.add(key)
+        # invariant: only fully-written blobs are ever present at a content key
+        assert set(backend.list()) == succeeded
 
-    # list() is exactly the successfully-put blobs — never a partial — and each verifies.
-    assert set(backend.list()) == succeeded
+    # each present blob hashes back to its key (never a partial)
     for key in succeeded:
-        assert DEFAULT_HASHER.hash(store.open(key)) == key  # verifies + hashes back to key
+        assert DEFAULT_HASHER.hash(store.open(key)) == key

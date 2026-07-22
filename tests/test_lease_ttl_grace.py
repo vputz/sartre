@@ -108,20 +108,30 @@ def test_self_check_never_leaves_a_dangling_pointer(files: dict[str, bytes], lap
 
 class _MtimeBackend(BlobBackend):
     """An in-memory blob backend with a settable clock, so a blob's recorded mtime is
-    the value of ``now`` when it was put. Drives the grace-period boundary deterministically.
+    the value of ``now`` when it was promoted. Drives the grace boundary deterministically.
     """
 
     def __init__(self) -> None:
         self._data: dict[str, bytes] = {}
         self._mtime: dict[str, float] = {}
+        self._staging: dict[str, bytes] = {}
+        self._n = 0
         self.now = 0.0
 
     def get(self, key: str) -> BinaryIO:
         return io.BytesIO(self._data[key])
 
-    def put(self, key: str, data: BinaryIO) -> None:
-        self._data[key] = data.read()
-        self._mtime[key] = self.now
+    def stage(self, data: BinaryIO) -> str:
+        self._n += 1
+        staging_key = f".tmp/{self._n}"
+        self._staging[staging_key] = data.read()
+        return staging_key
+
+    def promote(self, staging_key: str, final_key: str) -> None:
+        payload = self._staging.pop(staging_key)
+        if final_key not in self._data:  # idempotent: keep existing content + mtime
+            self._data[final_key] = payload
+            self._mtime[final_key] = self.now
 
     def exists(self, key: str) -> bool:
         return key in self._data
@@ -129,6 +139,7 @@ class _MtimeBackend(BlobBackend):
     def delete(self, key: str) -> None:
         self._data.pop(key, None)
         self._mtime.pop(key, None)
+        self._staging.pop(key, None)
 
     def list(self) -> Iterable[str]:
         return list(self._data)
