@@ -27,11 +27,35 @@ The system SHALL provide a `Repository` facade constructed from one `Registry` a
 - **THEN** the facade computes roots via the registry, sweeps unreferenced blobs via the store, and returns a result describing what was dropped
 
 ### Requirement: Publish holds a blob lease
-`Repository.publish` SHALL acquire a lease over its version and blob hashes before uploading them and SHALL release the lease after the publish completes, so that a concurrent `gc` treats the in-flight blobs as protected and the in-flight version as retained. The lease SHALL span from before the first blob upload through the pointer advance; if the publish fails or crashes, the lease MAY remain held (its version and blobs stay protected).
+`Repository.publish` SHALL acquire a lease over its version and blob hashes, with a TTL,
+before uploading them, so that a concurrent `gc` treats the in-flight blobs as protected
+and the in-flight version as retained. While the publish runs it SHALL keep the lease
+alive with a background heartbeat that renews the lease well within its TTL (a liveness
+device; safety does not depend on renewal succeeding). Immediately before committing its
+manifest, and again immediately before advancing its pointer, `publish` SHALL re-verify
+its lease is still live (via `renew_lease`); if the lease has lapsed it SHALL abort the
+publish — releasing the lease and raising a retryable error — rather than commit or
+advance over blobs GC may have reclaimed. Because blob puts are content-addressed and
+idempotent, a retried publish re-uploads safely. On completion or abort `publish` SHALL
+stop the heartbeat and release the lease. If the publish crashes, its lease MAY remain
+held until its TTL expires, after which its version and blobs become collectable.
 
 #### Scenario: Publish protects its blobs from concurrent GC
-- **WHEN** `publish` is uploading blobs and committing a manifest while `gc` runs
+- **WHEN** `publish` is uploading blobs and committing a manifest while `gc` runs, and its
+  lease is kept live by the heartbeat
 - **THEN** the publish's blobs are under a live lease and `gc` does not collect them
+
+#### Scenario: Publish aborts when its lease lapses before commit
+- **WHEN** a publish's lease expires mid-flight (e.g. an upload outran the TTL and a
+  heartbeat was missed) and its pre-commit self-check finds the lease lapsed
+- **THEN** `publish` aborts with a retryable error and does not commit a manifest over
+  possibly-reclaimed blobs
+
+#### Scenario: Publish aborts when its lease lapses before advancing the pointer
+- **WHEN** a publish's lease expires after commit but before the pointer CAS, and its
+  pre-advance self-check finds the lease lapsed
+- **THEN** `publish` aborts with a retryable error and does not point at a manifest whose
+  blobs GC may have reclaimed
 
 ### Requirement: Publish ordering through the facade
 `publish` SHALL upload blobs to the store before recording the manifest, skipping blobs already present (`has`), then `commit` the manifest, then advance the target pointer via compare-and-swap. The detailed crash-safe ordering and conflict-retry protocol is specified in a separate change; this facade SHALL expose the operation with that ordering intent.

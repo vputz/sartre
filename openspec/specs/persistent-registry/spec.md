@@ -51,18 +51,6 @@ same path SHALL recover the repository's published state.
   is created on the same directory
 - **THEN** the artifact resolves and its blobs are readable from the reopened repository
 
-### Requirement: Lease lifetime is process-scoped
-Leases coordinate in-flight publishes with GC within a running process and SHALL NOT be
-required to persist across process restart. On opening a database, `SqliteRegistry` SHALL
-start with no live leases, so a crashed process never leaves permanently-held leases in
-the database.
-
-#### Scenario: Leases do not persist across restart
-- **WHEN** a process acquires a lease and exits without releasing it, and the database is
-  reopened
-- **THEN** the reopened registry reports no active leases, so GC is not blocked by a dead
-  process's lease
-
 ### Requirement: Multi-writer compare-and-swap
 `set_pointer` SHALL perform its compare-and-swap as a single conditional write rather than
 a read-then-write: it advances the pointer only if the stored value still equals
@@ -89,4 +77,31 @@ through a `CachingStore` backed by a local on-disk cache over the remote store.
   it
 - **THEN** the manifest is served from the shared registry and the blobs from the
   object-store blob plane, with the local cache satisfying repeat reads when configured
+
+### Requirement: Durable, registry-clock TTL leases
+Leases SHALL be stored durably in the registry (a `leases` table in the SQL backends; an
+equivalent expiry-aware structure in the reference backend) so that every process sharing
+the registry observes the same set of live leases. Each lease SHALL carry an `expires_at`
+computed from the **registry's own clock** at `acquire`/`renew` time; the active-root
+queries SHALL filter on `expires_at > now()` evaluated by the registry, never by a client
+clock. A lease SHALL be reclaimed by expiry: once its ttl elapses it ceases to protect
+its version and hashes, so a crashed publisher cannot pin storage indefinitely. Durable
+leases SHALL NOT change observational equivalence for unexpired leases — a sequence of
+operations that never lets a lease expire SHALL behave identically to the reference
+backend.
+
+#### Scenario: A live lease is visible across registry instances
+- **WHEN** one registry instance acquires a lease over a shared database, and a second
+  instance over the same database queries active leases before the ttl elapses
+- **THEN** the second instance reports the lease's hashes and version as protected
+
+#### Scenario: A lapsed lease stops protecting across instances
+- **WHEN** the lease's ttl elapses against the registry clock with no renewal
+- **THEN** every instance's `active_leased_hashes`/`active_leased_versions` omits it, so
+  GC on any instance may reclaim the blobs
+
+#### Scenario: Expiry uses the registry clock, not the caller's
+- **WHEN** leases are acquired and queried
+- **THEN** `expires_at` is computed and compared using the registry's clock, so writers
+  and GC hosts with skewed local clocks agree on which leases are live
 
