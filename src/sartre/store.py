@@ -17,8 +17,9 @@ import shutil
 import threading
 import uuid
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
 from sartre.errors import IntegrityError, NotFound
 from sartre.hashing import DEFAULT_HASHER, Hasher, algorithm_of, hasher_for
@@ -27,6 +28,20 @@ from sartre.ports import BlobBackend, Store
 
 if TYPE_CHECKING:
     from fsspec import AbstractFileSystem
+
+
+def _as_epoch(value: Any) -> float | None:
+    """Coerce an fsspec mtime field (datetime, epoch number, or ISO string) to epoch."""
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 class FsspecBlobBackend(BlobBackend):
@@ -97,6 +112,16 @@ class FsspecBlobBackend(BlobBackend):
             self.fs.rm(path)
         return len(staged)
 
+    def mtime(self, key: str) -> float | None:
+        if not self.exists(key):
+            return None
+        info = self.fs.info(self._path(key))
+        # fsspec backends spell mtime differently; take the first recognised field.
+        for field_name in ("mtime", "LastModified", "last_modified", "created", "ctime"):
+            if field_name in info:
+                return _as_epoch(info[field_name])
+        return None
+
 
 class CasStore(Store):
     """Content-addressed :class:`Store` over a dumb :class:`BlobBackend`."""
@@ -140,6 +165,9 @@ class CasStore(Store):
 
     def list(self) -> Iterable[Hash]:
         return self.backend.list()
+
+    def mtime(self, content_hash: Hash) -> float | None:
+        return self.backend.mtime(content_hash)
 
 
 class CachingStore(Store):
@@ -190,3 +218,6 @@ class CachingStore(Store):
 
     def list(self) -> Iterable[Hash]:
         return self.remote.list()  # remote is the source of truth; local is a subset
+
+    def mtime(self, content_hash: Hash) -> float | None:
+        return self.remote.mtime(content_hash)  # remote is authoritative for age

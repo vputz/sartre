@@ -28,6 +28,8 @@ class PostgresRegistry(_SqlRegistry):
     _PLACEHOLDER = "%s"
     _SEQ_TYPE = "BIGSERIAL PRIMARY KEY"
     _BLOB_TYPE = "BYTEA"
+    _NOW_SQL = "EXTRACT(EPOCH FROM now())"
+    _TS_TYPE = "DOUBLE PRECISION"
 
     def __init__(self, dsn: str, hasher: Hasher = DEFAULT_HASHER) -> None:
         if psycopg is None:

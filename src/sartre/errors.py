@@ -21,6 +21,12 @@ class Conflict(SartreError):
     """A compare-and-swap pointer update found an unexpected current value."""
 
 
+class LeaseExpired(Conflict):
+    """A publish's lease lapsed mid-flight (before commit or before advancing the
+    pointer). The publish aborts rather than write over possibly-reclaimed blobs; it is
+    a retryable condition, so it subclasses :class:`Conflict`."""
+
+
 class IntegrityError(SartreError):
     """Fetched bytes did not hash to the requested content key."""
 

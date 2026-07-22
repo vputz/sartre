@@ -115,6 +115,9 @@ class _CountingStore:
     def list(self) -> Iterable[Hash]:
         return self.inner.list()
 
+    def mtime(self, content_hash: Hash) -> float | None:
+        return self.inner.mtime(content_hash)
+
 
 def test_concurrent_fetch_downloads_once(make_store: Callable[[], CasStore]) -> None:
     remote = _CountingStore(make_store())

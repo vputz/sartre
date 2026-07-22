@@ -12,18 +12,19 @@ from __future__ import annotations
 import asyncio
 import io
 import tempfile
+import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sartre.errors import Conflict, NotFound, PathError
+from sartre.errors import Conflict, LeaseExpired, NotFound, PathError
 from sartre.fs import SnapshotFS
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
 from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
 from sartre.paths import check_no_case_collisions, normalize_path
-from sartre.ports import Registry, Store
+from sartre.ports import DEFAULT_LEASE_TTL, Registry, Store
 
 
 def _pointer_ref(pointer: str) -> Ref:
@@ -36,11 +37,15 @@ class RetentionPolicy:
 
     ``keep_last_n`` retains the newest N distinct versions per coordinate (by
     commit-log order); ``keep_within`` retains versions whose log time is within
-    the duration of ``now``. The default (``0`` / ``None``) keeps only pointers.
+    the duration of ``now``. ``grace`` is a blob-only backstop: GC retains any blob
+    whose store mtime is younger than ``grace``, protecting the put→commit window of a
+    writer that took no lease (correctness rests on ``grace`` exceeding the max
+    publish duration). The default (``0`` / ``None``) keeps only pointers + live leases.
     """
 
     keep_last_n: int = 0
     keep_within: timedelta | None = None
+    grace: timedelta | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,11 +60,20 @@ class Repository:
     """Composes a :class:`Registry` and a :class:`Store` into the public surface."""
 
     def __init__(
-        self, registry: Registry, store: Store, *, hasher: Hasher = DEFAULT_HASHER
+        self,
+        registry: Registry,
+        store: Store,
+        *,
+        hasher: Hasher = DEFAULT_HASHER,
+        lease_ttl: float = DEFAULT_LEASE_TTL,
+        heartbeat_interval: float | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
         self._hasher = hasher  # pre-hashes payloads so a publish can lease before uploading
+        self._lease_ttl = lease_ttl
+        # renew well within the ttl; halving leaves room for one missed beat before lapse.
+        self._heartbeat_interval = heartbeat_interval or lease_ttl / 2
 
     def head(self, coord: Coordinate, ref: Ref = HEAD) -> Version:
         return self.registry.head(coord, ref)
@@ -132,10 +146,14 @@ class Repository:
     ) -> Version:
         """Full-replacement, fail-fast publish: lease → blobs → manifest → CAS pointer.
 
-        The version and blob hashes are derived up front (payloads are pre-hashed),
-        so the publish can hold a lease over ``(version, hashes)`` for its whole
-        duration — a concurrent GC then treats the in-flight blobs as protected and
-        the in-flight version as retained (see the garbage-collection capability).
+        The version and blob hashes are derived up front (payloads are pre-hashed), so the
+        publish holds a lease over ``(version, hashes)`` before uploading — a concurrent GC
+        treats the in-flight blobs as protected and the in-flight version as retained. A
+        background heartbeat renews the lease within its ttl (liveness); and — the
+        safety-critical step — the lease is re-verified live immediately before ``commit``
+        and again before the pointer CAS, aborting with :class:`LeaseExpired` (retryable)
+        if it lapsed, so a manifest is never committed or pointed over blobs GC may have
+        reclaimed. See the repository-facade and garbage-collection capabilities.
         """
         # Canonicalize paths and reject case-collisions up front (write-time path model).
         normalized = {normalize_path(path): data for path, data in files.items()}
@@ -155,14 +173,31 @@ class Repository:
         except NotFound:
             start = None  # first publish to this pointer
 
-        lease = self.registry.acquire_lease(version, hashes)
+        lease = self.registry.acquire_lease(version, hashes, self._lease_ttl)
+        stop = threading.Event()
+
+        def _heartbeat() -> None:  # liveness only: keep a long publish's lease from lapsing
+            while not stop.wait(self._heartbeat_interval):
+                try:
+                    self.registry.renew_lease(lease, self._lease_ttl)
+                except Exception:  # noqa: BLE001 - registry gone; the self-check will catch it
+                    return
+
+        beat = threading.Thread(target=_heartbeat, name="sartre-lease-heartbeat", daemon=True)
+        beat.start()
         try:
             for data in normalized.values():
                 self.store.put(io.BytesIO(data))  # blobs first (idempotent, dedup by hash)
+            if not self.registry.renew_lease(lease, self._lease_ttl):  # self-check before commit
+                raise LeaseExpired("publish lease lapsed before commit; retry")
             committed = self.registry.commit(coord, entries, dict(metadata or {}))
+            if not self.registry.renew_lease(lease, self._lease_ttl):  # self-check before advance
+                raise LeaseExpired("publish lease lapsed before pointer advance; retry")
             self.registry.set_pointer(coord, pointer, committed, expected=start)  # CAS
             return committed
         finally:
+            stop.set()
+            beat.join(timeout=1.0)
             self.registry.release_lease(lease)
 
     # --- garbage collection ---
@@ -234,13 +269,25 @@ class Repository:
                 pass  # became a pointer target between mark and sweep; leave it
 
         live_now = self._live_blobs()
+        grace_cutoff = now - policy.grace if policy.grace is not None else None
         deleted: list[Hash] = []
         for content_hash in candidate_blobs:
-            if content_hash not in live_now and self.store.has(content_hash):
+            if content_hash in live_now:
+                continue
+            if grace_cutoff is not None and self._within_grace(content_hash, grace_cutoff):
+                continue  # blob-only backstop: too young to sweep (unleased-writer window)
+            if self.store.has(content_hash):
                 self.store.delete(content_hash)
                 deleted.append(content_hash)
 
         return GCResult(dropped_versions=tuple(dropped), deleted_blobs=tuple(deleted))
+
+    def _within_grace(self, content_hash: Hash, cutoff: datetime) -> bool:
+        """Whether a blob's store mtime is at/after ``cutoff`` (younger than the grace window)."""
+        mt = self.store.mtime(content_hash)
+        if mt is None:  # backend can't report age → grace does not protect this blob
+            return False
+        return datetime.fromtimestamp(mt, UTC) >= cutoff
 
 
 class AsyncRepository:

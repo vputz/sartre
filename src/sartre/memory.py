@@ -11,7 +11,8 @@ transactional backend. Suitable for tests and local use; nothing is persisted.
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable, Mapping, Sequence, Set
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -19,7 +20,7 @@ from typing import Any
 from sartre.errors import Conflict, NotFound
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
 from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
-from sartre.ports import LeaseId, LogEntry
+from sartre.ports import DEFAULT_LEASE_TTL, LeaseId, LogEntry
 
 
 @dataclass(frozen=True)
@@ -47,11 +48,15 @@ class _CoordState:
 class MemoryRegistry:
     """In-memory implementation of the `Registry` port."""
 
-    def __init__(self, hasher: Hasher = DEFAULT_HASHER) -> None:
+    def __init__(
+        self, hasher: Hasher = DEFAULT_HASHER, *, clock: Callable[[], float] = time.time
+    ) -> None:
         self._hasher = hasher
+        self._clock = clock  # epoch seconds; injectable so lease TTL is testable
         self._manifests: dict[Version, _ManifestRecord] = {}
         self._coords: dict[tuple[str, str], _CoordState] = {}
-        self._leases: dict[LeaseId, tuple[Version, frozenset[Hash]]] = {}
+        # lease_id -> (version, hashes, expires_at-epoch)
+        self._leases: dict[LeaseId, tuple[Version, frozenset[Hash], float]] = {}
         self._next_lease = 0
         self._lock = threading.Lock()
 
@@ -178,12 +183,22 @@ class MemoryRegistry:
                 state.log = [e for e in state.log if e.version != version]
             self._manifests.pop(version, None)  # idempotent
 
-    def acquire_lease(self, version: Version, hashes: Set[Hash]) -> LeaseId:
+    def acquire_lease(
+        self, version: Version, hashes: Set[Hash], ttl: float = DEFAULT_LEASE_TTL
+    ) -> LeaseId:
         with self._lock:
             lease_id = LeaseId(self._next_lease)
             self._next_lease += 1
-            self._leases[lease_id] = (version, frozenset(hashes))
+            self._leases[lease_id] = (version, frozenset(hashes), self._clock() + ttl)
             return lease_id
+
+    def renew_lease(self, lease_id: LeaseId, ttl: float = DEFAULT_LEASE_TTL) -> bool:
+        with self._lock:
+            entry = self._leases.get(lease_id)
+            if entry is None or entry[2] <= self._clock():  # unknown or already lapsed
+                return False
+            self._leases[lease_id] = (entry[0], entry[1], self._clock() + ttl)
+            return True
 
     def release_lease(self, lease_id: LeaseId) -> None:
         with self._lock:
@@ -191,8 +206,10 @@ class MemoryRegistry:
 
     def active_leased_hashes(self) -> set[Hash]:
         with self._lock:
-            return {h for _version, hashes in self._leases.values() for h in hashes}
+            now = self._clock()
+            return {h for _v, hashes, exp in self._leases.values() if exp > now for h in hashes}
 
     def active_leased_versions(self) -> set[Version]:
         with self._lock:
-            return {version for version, _hashes in self._leases.values()}
+            now = self._clock()
+            return {version for version, _h, exp in self._leases.values() if exp > now}

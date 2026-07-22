@@ -22,6 +22,11 @@ from sartre.model import HEAD, Coordinate, Entry, Hash, Ref, Snapshot, Version
 LeaseId = NewType("LeaseId", int)
 """Opaque token identifying a live lease (see :meth:`Registry.acquire_lease`)."""
 
+DEFAULT_LEASE_TTL = 300.0
+"""Default lease time-to-live, in seconds. A publish renews well within this on a
+heartbeat; it is a liveness/throughput knob, not a safety parameter (safety comes
+from the pre-commit/pre-advance self-check — see the repository-facade capability)."""
+
 
 @dataclass(frozen=True, slots=True)
 class LogEntry:
@@ -116,12 +121,29 @@ class Registry(Protocol):
         """
         ...
 
-    def acquire_lease(self, version: Version, hashes: Set[Hash]) -> LeaseId:
+    def acquire_lease(
+        self, version: Version, hashes: Set[Hash], ttl: float = DEFAULT_LEASE_TTL
+    ) -> LeaseId:
         """Claim a version and its blob hashes as GC roots for an in-flight write.
 
-        Contract: a lease is not a lock — it grants no exclusive access. While held,
+        Contract: a lease is not a lock — it grants no exclusive access. The lease is
+        valid for ``ttl`` seconds against the **registry's own clock**; while it is live
         the version appears in :meth:`active_leased_versions` and the hashes in
-        :meth:`active_leased_hashes`, so a concurrent GC treats them as roots.
+        :meth:`active_leased_hashes`, so a concurrent GC treats them as roots. Once its
+        ttl elapses without a :meth:`renew_lease`, the lease expires and stops
+        protecting — so a crashed holder cannot pin storage forever. The lease is durable
+        (visible to every process sharing the registry), not process-scoped.
+        """
+        ...
+
+    def renew_lease(self, lease_id: LeaseId, ttl: float = DEFAULT_LEASE_TTL) -> bool:
+        """Extend a still-valid lease's expiry to ``now + ttl``; report whether it held.
+
+        Contract: evaluated against the registry clock. Returns ``True`` and extends the
+        lease if it exists and has not yet expired; returns ``False`` and revives nothing
+        if the lease is unknown or already expired. This doubles as the publish
+        **self-check**: a ``False`` return tells an in-flight publish its lease lapsed and
+        it must abort rather than commit or advance over possibly-reclaimed blobs.
         """
         ...
 
@@ -130,11 +152,11 @@ class Registry(Protocol):
         ...
 
     def active_leased_hashes(self) -> Set[Hash]:
-        """The union of blob hashes under all live leases."""
+        """The union of blob hashes under all live (unexpired) leases."""
         ...
 
     def active_leased_versions(self) -> Set[Version]:
-        """The union of versions under all live leases."""
+        """The union of versions under all live (unexpired) leases."""
         ...
 
 
@@ -171,6 +193,15 @@ class Store(Protocol):
         """Enumerate the content hashes of all stored blobs (the GC sweep domain)."""
         ...
 
+    def mtime(self, content_hash: Hash) -> float | None:
+        """Return the blob's last-modification time as epoch seconds, or ``None``.
+
+        Used by the GC grace-period backstop to retain recently-written blobs. ``None``
+        means the backend cannot report a mtime (grace protection then does not apply to
+        that blob).
+        """
+        ...
+
 
 @runtime_checkable
 class BlobBackend(Protocol):
@@ -199,4 +230,8 @@ class BlobBackend(Protocol):
 
     def list(self) -> Iterable[str]:
         """Enumerate all stored keys (surfaced by ``CasStore.list`` as content hashes)."""
+        ...
+
+    def mtime(self, key: str) -> float | None:
+        """Return ``key``'s last-modification time as epoch seconds, or ``None``."""
         ...

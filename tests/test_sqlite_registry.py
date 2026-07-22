@@ -101,13 +101,59 @@ def test_drop_version_refuses_pointer_target_and_prunes() -> None:
     reg.drop_version(v1)  # idempotent no-op
 
 
-def test_leases_are_in_memory() -> None:
+def test_lease_acquire_renew_release() -> None:
     reg = SqliteRegistry(":memory:")
-    lease = reg.acquire_lease("sha256:v", {"sha256:h1", "sha256:h2"})
+    lease = reg.acquire_lease("sha256:v", {"sha256:h1", "sha256:h2"}, ttl=100.0)
     assert reg.active_leased_hashes() == {"sha256:h1", "sha256:h2"}
     assert reg.active_leased_versions() == {"sha256:v"}
+    assert reg.renew_lease(lease, ttl=100.0) is True  # still valid → extends
     reg.release_lease(lease)
     assert reg.active_leased_hashes() == set()
+    assert reg.renew_lease(lease, ttl=100.0) is False  # released → unknown
+
+
+def test_lease_expiry_drops_from_active_set() -> None:
+    reg = SqliteRegistry(":memory:")
+    # A non-positive ttl makes expires_at <= now deterministically (registry clock).
+    expired = reg.acquire_lease("sha256:x", {"sha256:h"}, ttl=-1.0)
+    assert reg.active_leased_hashes() == set()  # already lapsed → not a root
+    assert reg.active_leased_versions() == set()
+    assert reg.renew_lease(expired, ttl=100.0) is False  # cannot revive a lapsed lease
+
+
+def test_memory_lease_ttl_with_injected_clock() -> None:
+    now = [1000.0]
+    reg = MemoryRegistry(clock=lambda: now[0])
+    lease = reg.acquire_lease("sha256:v", {"sha256:h"}, ttl=10.0)  # expires at 1010
+    assert reg.active_leased_versions() == {"sha256:v"}
+    now[0] = 1005.0
+    assert reg.renew_lease(lease, ttl=10.0) is True  # valid at 1005 → now expires at 1015
+    now[0] = 1020.0  # past the renewed expiry
+    assert reg.active_leased_versions() == set()
+    assert reg.active_leased_hashes() == set()
+    assert reg.renew_lease(lease, ttl=10.0) is False  # lapsed → cannot revive
+
+
+def test_postgres_multiwriter_lease_visibility(postgres_dsn: str) -> None:
+    """A lease taken by one registry instance is a GC root for another over the same DSN."""
+    from sartre import PostgresRegistry
+
+    writer = PostgresRegistry(postgres_dsn)
+    writer._conn.execute("TRUNCATE leases RESTART IDENTITY")
+    gc_view = PostgresRegistry(postgres_dsn)  # a separate connection, as a GC process would have
+    try:
+        lease = writer.acquire_lease("sha256:v", {"sha256:a", "sha256:b"}, ttl=100.0)
+        # The GC-side instance sees the other writer's in-flight lease (durable, shared).
+        assert gc_view.active_leased_hashes() == {"sha256:a", "sha256:b"}
+        assert gc_view.active_leased_versions() == {"sha256:v"}
+        writer.release_lease(lease)
+        assert gc_view.active_leased_hashes() == set()
+        # An already-expired lease never protects, even cross-instance.
+        writer.acquire_lease("sha256:w", {"sha256:c"}, ttl=-1.0)
+        assert gc_view.active_leased_hashes() == set()
+    finally:
+        writer.close()
+        gc_view.close()
 
 
 # --- durability ---
@@ -119,7 +165,7 @@ def test_state_survives_restart(tmp_path: Path) -> None:
     entries = (_entry("a.txt", b"one"), _entry("b/c.txt", b"two"))
     version = reg.commit(COORD, entries, {"note": "v1"})
     reg.set_pointer(COORD, "head", version, expected=None)
-    reg.acquire_lease(version, {"sha256:leaked"})  # never released
+    reg.acquire_lease(version, {"sha256:held"}, ttl=300.0)  # durable, within ttl
     reg.close()
 
     reopened = SqliteRegistry(dbfile)
@@ -128,7 +174,9 @@ def test_state_survives_restart(tmp_path: Path) -> None:
     assert snap.version == version
     assert {e.path for e in snap.entries} == {"a.txt", "b/c.txt"}
     assert snap.metadata == {"note": "v1"}
-    assert reopened.active_leased_versions() == set()  # leases not persisted
+    # Leases are now durable (registry-side): the still-valid lease survives the reopen,
+    # so multi-writer GC on any instance sees it. It is reclaimed by ttl expiry, not exit.
+    assert reopened.active_leased_versions() == {version}
 
 
 def test_open_local_round_trips_across_reopen(tmp_path: Path) -> None:
@@ -177,7 +225,7 @@ class DiffMachine(RuleBasedStateMachine):
         self.coords = [Coordinate("a", "dev"), Coordinate("a", "prod")]
         self.versions: list[Version] = []
         self.expected: dict[tuple[int, str], Version] = {}
-        self.leases: list[Any] = []
+        self.leases: list[tuple[Any, Any]] = []  # (memory lease id, sql lease id) pairs
 
     def teardown(self) -> None:
         self.sql.close()
@@ -239,20 +287,22 @@ class DiffMachine(RuleBasedStateMachine):
 
     @rule(vi=st.integers(min_value=0, max_value=9), hs=st.sets(_names, max_size=3))
     def acquire_lease(self, vi: int, hs: set[str]) -> None:
+        # Lease ids are backend-assigned opaque tokens (memory counter vs SQL autoincrement),
+        # so they need not match; observational equivalence is the active-set invariant. Both
+        # take the default (long) ttl, so nothing expires mid-sequence and the sets stay equal.
         version = self.versions[vi % len(self.versions)] if self.versions else "sha256:none"
         hashes = {f"sha256:{h}" for h in hs}
         lid_mem = self.mem.acquire_lease(version, hashes)
         lid_sql = self.sql.acquire_lease(version, hashes)
-        assert lid_mem == lid_sql
-        self.leases.append(lid_mem)
+        self.leases.append((lid_mem, lid_sql))
 
     @rule(li=st.integers(min_value=0, max_value=9))
     def release_lease(self, li: int) -> None:
         if not self.leases:
             return
-        lease = self.leases.pop(li % len(self.leases))
-        self.mem.release_lease(lease)
-        self.sql.release_lease(lease)
+        lid_mem, lid_sql = self.leases.pop(li % len(self.leases))
+        self.mem.release_lease(lid_mem)
+        self.sql.release_lease(lid_sql)
 
     @invariant()
     def backends_agree(self) -> None:
@@ -286,7 +336,7 @@ class PostgresDiffMachine(DiffMachine):
         from sartre import PostgresRegistry
 
         reg = PostgresRegistry(self._dsn)
-        reg._conn.execute("TRUNCATE manifests, entries, pointers, log RESTART IDENTITY")
+        reg._conn.execute("TRUNCATE manifests, entries, pointers, log, leases RESTART IDENTITY")
         return reg
 
 

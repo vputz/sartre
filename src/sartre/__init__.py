@@ -12,6 +12,7 @@ from sartre.cloud import open_cloud
 from sartre.errors import (
     Conflict,
     IntegrityError,
+    LeaseExpired,
     NotFound,
     PathError,
     SartreError,
@@ -65,6 +66,7 @@ __all__ = [
     "Hasher",
     "Head",
     "IntegrityError",
+    "LeaseExpired",
     "LeaseId",
     "LogEntry",
     "MemoryRegistry",

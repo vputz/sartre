@@ -61,6 +61,9 @@ class _RaisingStore:
     def list(self) -> Iterable[Hash]:
         raise AssertionError("listing must not enumerate blobs")
 
+    def mtime(self, content_hash: Hash) -> float | None:
+        raise AssertionError("read-only view")
+
 
 class _CountingRemote:
     """Wraps a Store and counts open() calls (a download probe)."""
@@ -87,6 +90,9 @@ class _CountingRemote:
 
     def list(self) -> Iterable[Hash]:
         return self.inner.list()
+
+    def mtime(self, content_hash: Hash) -> float | None:
+        return self.inner.mtime(content_hash)
 
 
 def test_listing_served_from_manifest_without_fetch() -> None:

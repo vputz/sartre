@@ -24,7 +24,7 @@ from typing import Any
 from sartre.errors import Conflict, NotFound
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
 from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
-from sartre.ports import LeaseId, LogEntry
+from sartre.ports import DEFAULT_LEASE_TTL, LeaseId, LogEntry
 
 # A DB-API connection (sqlite3 or psycopg); typed loosely since the two drivers'
 # overloaded signatures don't share a nominal protocol. Only execute/cursor are used.
@@ -37,12 +37,15 @@ class _SqlRegistry:
     _PLACEHOLDER = "?"
     _SEQ_TYPE = "INTEGER PRIMARY KEY AUTOINCREMENT"
     _BLOB_TYPE = "BLOB"
+    # A SQL scalar expression giving the registry's current time as epoch seconds. All
+    # lease-expiry arithmetic and comparison uses this — the *registry's* clock, never a
+    # client's — so writers and GC hosts with skewed local clocks still agree.
+    _NOW_SQL = "(julianday('now') - 2440587.5) * 86400.0"
+    _TS_TYPE = "REAL"  # column type for an epoch-seconds timestamp
 
     def __init__(self, hasher: Hasher = DEFAULT_HASHER) -> None:
         self._hasher = hasher
         self._lock = threading.RLock()
-        self._leases: dict[LeaseId, tuple[Version, frozenset[Hash]]] = {}
-        self._next_lease = 0
         self._conn = self._connect()
         with self._lock:
             for statement in self._schema():
@@ -75,6 +78,8 @@ class _SqlRegistry:
             f"CREATE TABLE IF NOT EXISTS log (seq {self._SEQ_TYPE}, "
             "coord_name TEXT NOT NULL, coord_env TEXT NOT NULL, version TEXT NOT NULL, "
             "pointer TEXT NOT NULL, created_at TEXT NOT NULL)",
+            f"CREATE TABLE IF NOT EXISTS leases (lease_id {self._SEQ_TYPE}, "
+            f"version TEXT NOT NULL, hashes TEXT NOT NULL, expires_at {self._TS_TYPE} NOT NULL)",
         ]
 
     # --- execution helpers ---
@@ -268,23 +273,44 @@ class _SqlRegistry:
             self._exec(conn, "DELETE FROM entries WHERE version=?", (version,))
             self._exec(conn, "DELETE FROM manifests WHERE version=?", (version,))  # idempotent
 
-    # --- Registry port: lease surface (in-memory, process-scoped) ---
+    # --- Registry port: lease surface (durable, registry-clock TTL) ---
 
-    def acquire_lease(self, version: Version, hashes: Set[Hash]) -> LeaseId:
-        with self._lock:
-            lease_id = LeaseId(self._next_lease)
-            self._next_lease += 1
-            self._leases[lease_id] = (version, frozenset(hashes))
-            return lease_id
+    def acquire_lease(
+        self, version: Version, hashes: Set[Hash], ttl: float = DEFAULT_LEASE_TTL
+    ) -> LeaseId:
+        with self._tx() as conn:
+            row = self._exec(
+                conn,
+                "INSERT INTO leases(version, hashes, expires_at) "
+                f"VALUES (?, ?, {self._NOW_SQL} + ?) RETURNING lease_id",
+                (version, json.dumps(sorted(hashes)), ttl),
+            ).fetchone()
+            return LeaseId(int(row[0]))
+
+    def renew_lease(self, lease_id: LeaseId, ttl: float = DEFAULT_LEASE_TTL) -> bool:
+        with self._tx() as conn:
+            cur = self._exec(
+                conn,
+                f"UPDATE leases SET expires_at = {self._NOW_SQL} + ? "
+                f"WHERE lease_id = ? AND expires_at > {self._NOW_SQL}",
+                (ttl, lease_id),
+            )
+            return cur.rowcount == 1
 
     def release_lease(self, lease_id: LeaseId) -> None:
-        with self._lock:
-            self._leases.pop(lease_id, None)
+        with self._tx() as conn:
+            self._exec(conn, "DELETE FROM leases WHERE lease_id = ?", (lease_id,))
 
     def active_leased_hashes(self) -> set[Hash]:
         with self._lock:
-            return {h for _version, hashes in self._leases.values() for h in hashes}
+            rows = self._exec(
+                self._conn, f"SELECT hashes FROM leases WHERE expires_at > {self._NOW_SQL}"
+            ).fetchall()
+            return {h for r in rows for h in json.loads(r[0])}
 
     def active_leased_versions(self) -> set[Version]:
         with self._lock:
-            return {version for version, _hashes in self._leases.values()}
+            rows = self._exec(
+                self._conn, f"SELECT version FROM leases WHERE expires_at > {self._NOW_SQL}"
+            ).fetchall()
+            return {r[0] for r in rows}
