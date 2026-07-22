@@ -167,10 +167,13 @@ def _resolve_norm(reg: Any, coord: Coordinate, ref: Any) -> Any:
 
 
 class DiffMachine(RuleBasedStateMachine):
+    def _new_sql(self) -> Any:
+        return SqliteRegistry(":memory:")
+
     def __init__(self) -> None:
         super().__init__()
         self.mem = MemoryRegistry()
-        self.sql = SqliteRegistry(":memory:")
+        self.sql = self._new_sql()
         self.coords = [Coordinate("a", "dev"), Coordinate("a", "prod")]
         self.versions: list[Version] = []
         self.expected: dict[tuple[int, str], Version] = {}
@@ -272,3 +275,26 @@ class DiffMachine(RuleBasedStateMachine):
 
 DiffMachine.TestCase.settings = settings(max_examples=50, stateful_step_count=30, deadline=None)
 TestDiffMachine = DiffMachine.TestCase
+
+
+class PostgresDiffMachine(DiffMachine):
+    """Same differential machine, but the SQL side is a real Postgres."""
+
+    _dsn = ""
+
+    def _new_sql(self) -> Any:
+        from sartre import PostgresRegistry
+
+        reg = PostgresRegistry(self._dsn)
+        reg._conn.execute("TRUNCATE manifests, entries, pointers, log RESTART IDENTITY")
+        return reg
+
+
+def test_postgres_differential_equivalence(postgres_dsn: str) -> None:
+    from hypothesis.stateful import run_state_machine_as_test
+
+    PostgresDiffMachine._dsn = postgres_dsn
+    run_state_machine_as_test(
+        PostgresDiffMachine,
+        settings=settings(max_examples=25, stateful_step_count=20, deadline=None),
+    )

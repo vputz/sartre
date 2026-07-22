@@ -8,6 +8,7 @@ content-hash ↔ bytes), composed by a ``Repository``. See
 
 from __future__ import annotations
 
+from sartre.cloud import open_cloud
 from sartre.errors import (
     Conflict,
     IntegrityError,
@@ -42,6 +43,7 @@ from sartre.model import (
 )
 from sartre.paths import check_no_case_collisions, normalize_path
 from sartre.ports import BlobBackend, LeaseId, LogEntry, Registry, Store
+from sartre.postgres import PostgresRegistry
 from sartre.repository import AsyncRepository, GCResult, Repository, RetentionPolicy
 from sartre.sqlite import SqliteRegistry
 from sartre.store import CachingStore, CasStore, FsspecBlobBackend
@@ -69,6 +71,7 @@ __all__ = [
     "NotFound",
     "PathError",
     "Pin",
+    "PostgresRegistry",
     "Ref",
     "Registry",
     "Repository",
@@ -86,6 +89,7 @@ __all__ = [
     "make_key",
     "manifest_version",
     "normalize_path",
+    "open_cloud",
     "open_local",
     "parse_key",
 ]
