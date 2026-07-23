@@ -13,7 +13,7 @@ import asyncio
 import io
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -25,7 +25,7 @@ from sartre.fs import SnapshotFS
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
 from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
 from sartre.paths import check_no_case_collisions, normalize_path
-from sartre.ports import DEFAULT_LEASE_TTL, Registry, Store
+from sartre.ports import DEFAULT_LEASE_TTL, LogEntry, Registry, Store
 
 
 def _pointer_ref(pointer: str) -> Ref:
@@ -311,6 +311,33 @@ class Repository:
         if mt is None:  # backend can't report age → grace does not protect this blob
             return False
         return datetime.fromtimestamp(mt, UTC) >= cutoff
+
+    # --- pointer plane & enumeration (promotion/rollback + read-only listing) ---
+
+    def point(
+        self, coord: Coordinate, name: str, version: Version, *, expected: Version | None
+    ) -> None:
+        """Move a mutable pointer (head or a named alias) to a committed ``version``.
+
+        Pointer plane only — no blob upload, no new manifest. Delegates to the registry's
+        compare-and-swap ``set_pointer``: advances only if the pointer's current value
+        equals ``expected`` (``None`` requires it to be unset), raising
+        :class:`~sartre.errors.Conflict` otherwise, and :class:`~sartre.errors.NotFound`
+        if ``version`` is not a committed version. The promotion/rollback primitive.
+        """
+        self.registry.set_pointer(coord, name, version, expected=expected)
+
+    def list_coordinates(self) -> Sequence[Coordinate]:
+        """Every coordinate the registry holds (no blob fetch)."""
+        return self.registry.list_coordinates()
+
+    def list_log(self, coord: Coordinate) -> Sequence[LogEntry]:
+        """A coordinate's commit log, oldest first (no blob fetch)."""
+        return self.registry.list_log(coord)
+
+    def list_pointers(self, coord: Coordinate) -> Mapping[str, Version]:
+        """A coordinate's mutable pointers as ``name -> version`` (no blob fetch)."""
+        return self.registry.list_pointers(coord)
 
 
 class AsyncRepository:
