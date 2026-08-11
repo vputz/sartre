@@ -8,6 +8,27 @@ license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "Vic Putz", email = "vputz@protonmail.com" }
 ]
+keywords = [
+    "artifact-repository",
+    "content-addressed",
+    "versioning",
+    "blob-store",
+    "model-registry",
+    "data-versioning",
+    "fsspec",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control",
+    "Topic :: System :: Archiving",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
 requires-python = ">=3.12"
 # fsspec is core: it is the filesystem abstraction used on both ends — as the
 # read-only SnapshotFS view and as the FsspecBlobBackend over any fs. It is
@@ -37,6 +58,11 @@ postgres = [
 cli = [
     "typer>=0.12",
 ]
+
+[project.urls]
+Homepage = "https://github.com/vputz/sartre"
+Repository = "https://github.com/vputz/sartre"
+Issues = "https://github.com/vputz/sartre/issues"
 
 [project.scripts]
 sartre = "sartre.cli:main"
