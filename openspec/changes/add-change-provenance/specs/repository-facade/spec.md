@@ -45,7 +45,7 @@ The `Repository` SHALL provide `point(coord, name, version, *, expected, actor="
 ## ADDED Requirements
 
 ### Requirement: Publish carries provenance
-The `Repository.publish` operation SHALL accept `actor` and `reason`, threading them to the commit event. `actor` MAY be omitted and SHALL then be recorded as `"unknown"`; `reason` is free text. The publish SHALL NOT place the reason into the manifest `metadata`.
+The `Repository.publish` operation SHALL accept `actor` and `reason`, threading them to the `set_pointer` that makes the new version the pointer's tip (where provenance is recorded), not to `commit`. `actor` MAY be omitted and SHALL then be recorded as `"unknown"`; `reason` is free text. The publish SHALL NOT place the reason into the manifest `metadata`.
 
 #### Scenario: Publish records the committing actor and reason
 - **WHEN** `publish(coord, sources, actor="alice", reason="retrain")` is called

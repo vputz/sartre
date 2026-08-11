@@ -20,7 +20,7 @@ from typing import Any
 from sartre.errors import Conflict, NotFound
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
 from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
-from sartre.ports import DEFAULT_LEASE_TTL, LeaseId, LogEntry
+from sartre.ports import DEFAULT_LEASE_TTL, LeaseId, LogEntry, PointerMove
 
 
 @dataclass(frozen=True)
@@ -36,12 +36,15 @@ class _LogEntry:
     version: Version
     created_at: datetime
     pointer: str
+    actor: str = "unknown"
+    reason: str | None = None
 
 
 @dataclass
 class _CoordState:
     pointers: dict[str, Version] = field(default_factory=dict)  # pointer name -> version
     log: list[_LogEntry] = field(default_factory=list)
+    moves: list[PointerMove] = field(default_factory=list)  # append-only audit history
     next_seq: int = 0
 
 
@@ -136,7 +139,14 @@ class MemoryRegistry:
             return version
 
     def set_pointer(
-        self, coord: Coordinate, name: str, version: Version, *, expected: Version | None
+        self,
+        coord: Coordinate,
+        name: str,
+        version: Version,
+        *,
+        expected: Version | None,
+        actor: str = "unknown",
+        reason: str | None = None,
     ) -> None:
         with self._lock:
             if version not in self._manifests:
@@ -148,13 +158,26 @@ class MemoryRegistry:
                     f"pointer {name!r} for {coord} is {current}, expected {expected}"
                 )
             state = self._state(coord)  # committing to write → now materialize
+            now = datetime.now(UTC)
             state.pointers[name] = version
             state.log.append(
                 _LogEntry(
                     seq=state.next_seq,
                     version=version,
-                    created_at=datetime.now(UTC),
+                    created_at=now,
                     pointer=name,
+                    actor=actor,
+                    reason=reason,
+                )
+            )
+            state.moves.append(  # append-only provenance audit; from_version = prior value
+                PointerMove(
+                    name=name,
+                    from_version=current,
+                    to_version=version,
+                    actor=actor,
+                    reason=reason,
+                    at=now,
                 )
             )
             state.next_seq += 1
@@ -169,9 +192,20 @@ class MemoryRegistry:
         with self._lock:
             state = self._peek(coord)
             return [
-                LogEntry(version=e.version, seq=e.seq, created_at=e.created_at)
+                LogEntry(
+                    version=e.version,
+                    seq=e.seq,
+                    created_at=e.created_at,
+                    actor=e.actor,
+                    reason=e.reason,
+                )
                 for e in (state.log if state else ())
             ]
+
+    def list_pointer_history(self, coord: Coordinate) -> Sequence[PointerMove]:
+        with self._lock:
+            state = self._peek(coord)
+            return list(state.moves) if state else []
 
     def drop_version(self, version: Version) -> None:
         with self._lock:

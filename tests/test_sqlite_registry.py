@@ -242,8 +242,17 @@ class DiffMachine(RuleBasedStateMachine):
     def _both_set_pointer(
         self, coord: Coordinate, name: str, version: Version, expected: Version | None
     ) -> tuple[str, Any]:
-        out_mem = _attempt(lambda: self.mem.set_pointer(coord, name, version, expected=expected))
-        out_sql = _attempt(lambda: self.sql.set_pointer(coord, name, version, expected=expected))
+        actor, reason = f"actor-{name}", f"reason-{name}"  # identical provenance to both backends
+        out_mem = _attempt(
+            lambda: self.mem.set_pointer(
+                coord, name, version, expected=expected, actor=actor, reason=reason
+            )
+        )
+        out_sql = _attempt(
+            lambda: self.sql.set_pointer(
+                coord, name, version, expected=expected, actor=actor, reason=reason
+            )
+        )
         assert out_mem == out_sql
         return out_mem
 
@@ -314,8 +323,17 @@ class DiffMachine(RuleBasedStateMachine):
         for coord in self.coords:
             assert dict(self.mem.list_pointers(coord)) == dict(self.sql.list_pointers(coord))
             assert list(self.mem.list_versions(coord)) == list(self.sql.list_versions(coord))
-            assert [e.version for e in self.mem.list_log(coord)] == [
-                e.version for e in self.sql.list_log(coord)
+            # commit-log provenance agrees (timestamps are backend-local, so excluded)
+            assert [(e.version, e.actor, e.reason) for e in self.mem.list_log(coord)] == [
+                (e.version, e.actor, e.reason) for e in self.sql.list_log(coord)
+            ]
+            # pointer-move history agrees, in order (excluding the backend-local `at`)
+            assert [
+                (m.name, m.from_version, m.to_version, m.actor, m.reason)
+                for m in self.mem.list_pointer_history(coord)
+            ] == [
+                (m.name, m.from_version, m.to_version, m.actor, m.reason)
+                for m in self.sql.list_pointer_history(coord)
             ]
             assert _attempt(lambda c=coord: self.mem.head(c)) == _attempt(  # type: ignore[misc]
                 lambda c=coord: self.sql.head(c)
@@ -336,7 +354,9 @@ class PostgresDiffMachine(DiffMachine):
         from sartre import PostgresRegistry
 
         reg = PostgresRegistry(self._dsn)
-        reg._conn.execute("TRUNCATE manifests, entries, pointers, log, leases RESTART IDENTITY")
+        reg._conn.execute(
+            "TRUNCATE manifests, entries, pointers, log, pointer_moves, leases RESTART IDENTITY"
+        )
         return reg
 
 

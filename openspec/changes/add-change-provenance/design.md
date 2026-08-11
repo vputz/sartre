@@ -49,7 +49,7 @@ Provenance is an **additive side-record** written in the *same transaction* as t
 - Memory backend mirrors both as in-process lists so it stays a faithful differential oracle.
 
 ### API surface
-- `ports.py`: `LogEntry(+actor,+reason)`; new `PointerMove` dataclass; `commit(..., *, actor, reason)`, `set_pointer(..., *, actor, reason)`, `list_pointer_history(coord)`.
+- `ports.py`: `LogEntry(+actor,+reason)`; new `PointerMove` dataclass; `set_pointer(..., *, actor="unknown", reason=None)`, `list_pointer_history(coord)`. **`commit` is unchanged** — discovered during apply that in both backends the commit-log row is appended by `set_pointer`, not `commit`; `commit` only records the shared, content-addressed manifest, so it carries no provenance. This *strengthens* the "provenance on events, not the manifest" thesis: `set_pointer` (the tip event) is the sole provenance write point, stamping both the log row and the pointer-move history. A manifest committed but never made a tip has no attribution — acceptable, since the public `publish` always pairs commit+set_pointer.
 - `repository.py`: `publish(..., actor="unknown", reason=None)`, `point(..., actor="unknown", reason=None)`, `list_pointer_history` delegator.
 - `cli`: `--author/--as` + `-m→reason` on `publish`/`point`; new `history` command; `show`/`log` print actor/reason; author resolution in `cli/config.py`. `ops.py` stays Typer-free.
 

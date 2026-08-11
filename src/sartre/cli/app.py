@@ -62,6 +62,11 @@ def _target(ctx: typer.Context) -> config.RepoTarget:
     )
 
 
+def _author(target: config.RepoTarget, flag: str | None) -> str:
+    """Resolve the required author for a mutating command (flag › env › profile › OS user)."""
+    return config.resolve_author(flag=flag, target=target)
+
+
 def _emit(ctx: typer.Context, human: str, data: Any) -> None:
     if ctx.obj["json"]:
         typer.echo(json.dumps(data, indent=2))
@@ -94,6 +99,8 @@ def show(ctx: typer.Context, ref: str = _REF) -> None:
         human = "\n".join([
             f"version:  {data['version']}",
             f"created:  {data['created_at']}",
+            f"author:   {data['actor'] or '(unknown)'}",
+            f"reason:   {data['reason'] or '(none)'}",
             f"metadata: {meta}",
             "",
             _table(rows, ["path", "size", "content_hash"]) if rows else "(no entries)",
@@ -154,8 +161,16 @@ def log(ctx: typer.Context, coord: str = typer.Argument(..., help="name/env")) -
         c = refs.parse_coord(coord, default_env=target.default_env)
         rows = ops.log(config.open_target(target), c)
         human = _table(
-            [[r["version"], r["created_at"], ",".join(r["pointers"]) or "-"] for r in rows],
-            ["version", "created", "pointers"],
+            [
+                [
+                    r["version"],
+                    r["actor"],
+                    r["reason"] or "-",
+                    ",".join(r["pointers"]) or "-",
+                ]
+                for r in rows
+            ],
+            ["version", "author", "reason", "pointers"],
         )
         _emit(ctx, human, rows)
 
@@ -166,6 +181,29 @@ def coords(ctx: typer.Context) -> None:
     with _handle():
         rows = ops.coords(config.open_target(_target(ctx)))
         human = "\n".join(f"{c['name']}/{c['env']}" for c in rows)
+        _emit(ctx, human, rows)
+
+
+@app.command()
+def history(ctx: typer.Context, coord: str = typer.Argument(..., help="name/env")) -> None:
+    """Show a coordinate's pointer-move history (who moved what, from → to, and why)."""
+    with _handle():
+        target = _target(ctx)
+        c = refs.parse_coord(coord, default_env=target.default_env)
+        rows = ops.pointer_history(config.open_target(target), c)  # oldest → newest (JSON order)
+        human = _table(
+            [
+                [
+                    m["pointer"],
+                    f"{m['from_version'] or '-'} -> {m['to_version']}",
+                    m["actor"],
+                    m["reason"] or "-",
+                    m["at"],
+                ]
+                for m in reversed(rows)  # human table reads newest-first
+            ],
+            ["pointer", "move", "author", "reason", "at"],
+        )
         _emit(ctx, human, rows)
 
 
@@ -193,12 +231,14 @@ def publish(
     sources: list[str] = typer.Argument(..., help="A directory, files, or logical=source."),
     pointer: str = typer.Option("head", "-p", "--pointer", help="Pointer to advance."),
     also: str | None = typer.Option(None, "--point", help="Also advance this alias."),
-    message: str | None = typer.Option(None, "-m", "--message", help="Metadata message."),
-    meta: list[str] = typer.Option([], "--meta", help="Metadata key=value (repeatable)."),
+    author: str | None = typer.Option(None, "--author", "--as", help="Who is publishing."),
+    message: str | None = typer.Option(None, "-m", "--message", help="Why (the change reason)."),
+    meta: list[str] = typer.Option([], "--meta", help="Domain metadata key=value (repeatable)."),
 ) -> None:
     """Publish files as a new version (full replacement of the coordinate's tree)."""
     with _handle():
         target = _target(ctx)
+        who = _author(target, author)
         c = refs.parse_coord(coord, default_env=target.default_env)
         metadata: dict[str, Any] = {}
         for item in meta:
@@ -206,11 +246,9 @@ def publish(
                 raise CliError(f"--meta expects key=value, got {item!r}")
             k, _, v = item.partition("=")
             metadata[k] = v
-        if message is not None:
-            metadata["message"] = message
         version = ops.publish(
             config.open_target(target), c, ops.gather_sources(sources),
-            pointer=pointer, also_alias=also, metadata=metadata,
+            pointer=pointer, also_alias=also, metadata=metadata, actor=who, reason=message,
         )
         _emit(ctx, version, {"version": version})
 
@@ -220,16 +258,22 @@ def point(
     ctx: typer.Context,
     target_ref: str = typer.Argument(..., help="name/env[:pointer] (default head)."),
     source: str = typer.Argument(..., help="A version id, 'head', or an alias name."),
+    author: str | None = typer.Option(None, "--author", "--as", help="Who is moving it."),
+    message: str | None = typer.Option(None, "-m", "--message", help="Why (the move reason)."),
     force: bool = typer.Option(False, "--force", help="Move even if it changed (last wins)."),
 ) -> None:
     """Move a mutable pointer to an existing version (promote / re-alias / rollback)."""
     with _handle():
         target = _target(ctx)
+        who = _author(target, author)
         coord, r = refs.parse_ref(target_ref, default_env=target.default_env)
         name = refs.pointer_name(r)
         src = refs.parse_source(coord, source)
         try:
-            version = ops.move_pointer(config.open_target(target), coord, name, src, force=force)
+            version = ops.move_pointer(
+                config.open_target(target), coord, name, src,
+                force=force, actor=who, reason=message,
+            )
         except Conflict as exc:
             raise CliError(
                 f"{name!r} moved since it was read — re-run, or pass --force"

@@ -65,12 +65,23 @@ def _entry_rows(repo: Repository, coord: Coordinate, ref: Ref) -> list[dict[str,
     ]
 
 
+def _commit_provenance(repo: Repository, coord: Coordinate, version: Version) -> dict[str, Any]:
+    """The actor/reason of the tip event that first made ``version`` a tip (its creator)."""
+    for e in repo.list_log(coord):  # oldest first → first match is the creating event
+        if e.version == version:
+            return {"actor": e.actor, "reason": e.reason}
+    return {"actor": None, "reason": None}
+
+
 def show(repo: Repository, coord: Coordinate, ref: Ref) -> dict[str, Any]:
     snap = repo.resolve(coord, ref)
+    prov = _commit_provenance(repo, coord, snap.version)
     return {
         "coordinate": {"name": coord.name, "env": coord.env},
         "version": snap.version,
         "created_at": snap.created_at.isoformat(),
+        "actor": prov["actor"],
+        "reason": prov["reason"],
         "metadata": dict(snap.metadata),
         "entries": [
             {"path": e.path, "content_hash": e.content_hash, "size": e.size} for e in snap.entries
@@ -102,9 +113,26 @@ def log(repo: Repository, coord: Coordinate) -> list[dict[str, Any]]:
             "version": e.version,
             "seq": e.seq,
             "created_at": e.created_at.isoformat(),
+            "actor": e.actor,
+            "reason": e.reason,
             "pointers": sorted(at.get(e.version, [])),
         }
         for e in repo.list_log(coord)
+    ]
+
+
+def pointer_history(repo: Repository, coord: Coordinate) -> list[dict[str, Any]]:
+    """The coordinate's pointer-move audit trail as plain dicts (oldest first)."""
+    return [
+        {
+            "pointer": m.name,
+            "from_version": m.from_version,
+            "to_version": m.to_version,
+            "actor": m.actor,
+            "reason": m.reason,
+            "at": m.at.isoformat(),
+        }
+        for m in repo.list_pointer_history(coord)
     ]
 
 
@@ -128,14 +156,18 @@ def publish(
     pointer: str = "head",
     also_alias: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    actor: str = "unknown",
+    reason: str | None = None,
 ) -> Version:
     """Full-replacement publish of the given ``{logical: file}`` map; returns the version."""
     if not sources:
         raise CliError("nothing to publish: give a directory or one or more files")
     files: dict[str, Path] = dict(sources)
-    version = repo.publish(coord, files, pointer=pointer, metadata=dict(metadata or {}))
+    version = repo.publish(
+        coord, files, pointer=pointer, metadata=dict(metadata or {}), actor=actor, reason=reason
+    )
     if also_alias is not None and also_alias != pointer:
-        move_pointer(repo, coord, also_alias, Pin(version), force=False)
+        move_pointer(repo, coord, also_alias, Pin(version), force=False, actor=actor, reason=reason)
     return version
 
 
@@ -146,12 +178,15 @@ def move_pointer(
     source: Ref,
     *,
     force: bool,
+    actor: str = "unknown",
+    reason: str | None = None,
     max_retries: int = 5,
 ) -> Version:
     """Move pointer ``name`` to the version ``source`` resolves to. CAS-safe unless ``force``.
 
     Raises :class:`~sartre.errors.Conflict` on a concurrent move when not forcing; with
-    ``force`` it re-reads and retries (last-writer-wins).
+    ``force`` it re-reads and retries (last-writer-wins). ``actor``/``reason`` attribute
+    each attempted move in the pointer-move history.
     """
     from sartre.errors import Conflict, NotFound
 
@@ -163,7 +198,7 @@ def move_pointer(
         except NotFound:
             current = None
         try:
-            repo.point(coord, name, version, expected=current)
+            repo.point(coord, name, version, expected=current, actor=actor, reason=reason)
             return version
         except Conflict:
             if not force:

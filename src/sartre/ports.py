@@ -30,11 +30,35 @@ from the pre-commit/pre-advance self-check — see the repository-facade capabil
 
 @dataclass(frozen=True, slots=True)
 class LogEntry:
-    """One commit-log row: a version that became a tip, with its order and time."""
+    """One commit-log row: a version that became a tip, with its order, time, and provenance.
+
+    ``actor``/``reason`` are event provenance — who committed this version into the
+    coordinate and why. They live on the log event, never on the shared manifest (see the
+    change-provenance capability): the same version committed into two coordinates records
+    two distinct provenances.
+    """
 
     version: Version
     seq: int
     created_at: datetime
+    actor: str = "unknown"
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PointerMove:
+    """One append-only pointer-move record: who moved a pointer, from what, to what, and why.
+
+    ``from_version`` is ``None`` when the pointer was created (had no prior value). A move is
+    recorded only for a *successful* compare-and-swap; a rejected CAS records nothing.
+    """
+
+    name: str
+    from_version: Version | None
+    to_version: Version
+    actor: str
+    reason: str | None
+    at: datetime
 
 
 @runtime_checkable
@@ -75,23 +99,36 @@ class Registry(Protocol):
     ) -> Version:
         """Record a new immutable manifest version and return its id.
 
-        Contract: committing does NOT advance any mutable pointer. Committing is
+        Contract: committing does NOT advance any mutable pointer, and records NO
+        provenance — the manifest is content-addressed and shared, so who/why lives on
+        the tip event written by :meth:`set_pointer`, never here. Committing is
         content-idempotent — committing the same ``(path, content_hash)`` entries
         returns the same :data:`~sartre.model.Version` and stores no duplicate
-        manifest, regardless of ``metadata``, entry order, or coordinate (the
-        version is the content hash of the manifest; see
-        :func:`sartre.hashing.manifest_version`).
+        manifest, regardless of ``metadata``, entry order, or coordinate (the version is
+        the content hash of the manifest; see :func:`sartre.hashing.manifest_version`).
         """
         ...
 
     def set_pointer(
-        self, coord: Coordinate, name: str, version: Version, *, expected: Version | None
+        self,
+        coord: Coordinate,
+        name: str,
+        version: Version,
+        *,
+        expected: Version | None,
+        actor: str = "unknown",
+        reason: str | None = None,
     ) -> None:
         """Atomically advance a mutable pointer via compare-and-swap.
 
         Contract: the pointer advances only if its current value equals
         ``expected`` (``None`` means "must not currently exist"). On mismatch,
-        raise :class:`~sartre.errors.Conflict` and leave the pointer unchanged.
+        raise :class:`~sartre.errors.Conflict` and leave the pointer unchanged. On
+        success, within the same transaction: stamp ``actor``/``reason`` on the tip
+        (commit-log) event appended for this move, and append one :class:`PointerMove`
+        to the coordinate's pointer-move history capturing ``(name, expected, version,
+        actor, reason, now)``. A rejected CAS writes neither. ``actor`` defaults to
+        ``"unknown"`` when omitted — this is the sole write point for change provenance.
         """
         ...
 
@@ -104,8 +141,18 @@ class Registry(Protocol):
     def list_log(self, coord: Coordinate) -> Sequence[LogEntry]:
         """Return the coordinate's commit log in sequence order (oldest first).
 
-        Each :class:`LogEntry` carries ``(version, seq, created_at)``, so a garbage
-        collector can apply ``keep_last_n`` (by order) and ``keep_within`` (by time).
+        Each :class:`LogEntry` carries ``(version, seq, created_at, actor, reason)``, so a
+        garbage collector can apply ``keep_last_n`` (by order) and ``keep_within`` (by time),
+        and a caller can see who committed each version and why.
+        """
+        ...
+
+    def list_pointer_history(self, coord: Coordinate) -> Sequence[PointerMove]:
+        """Return the coordinate's pointer-move history in append order (oldest first).
+
+        Each :class:`PointerMove` carries ``(name, from_version, to_version, actor, reason,
+        at)``, answering "who moved this pointer, from what, to what, and why." The history
+        is append-only.
         """
         ...
 

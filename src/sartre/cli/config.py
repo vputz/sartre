@@ -6,6 +6,7 @@ is inferred — a path opens local, a registry DSN + blob URL opens cloud.
 
 from __future__ import annotations
 
+import getpass
 import os
 import tomllib
 from collections.abc import Mapping
@@ -32,6 +33,7 @@ class RepoTarget:
     blob_url: str | None = None
     cache_dir: str | None = None
     storage_options: Mapping[str, Any] = field(default_factory=dict)
+    author: str | None = None  # profile default for change attribution (see resolve_author)
 
     @property
     def kind(self) -> str:
@@ -63,8 +65,9 @@ def _detect_local(cwd: Path) -> str | None:
 
 def _target_from_profile(prof: Mapping[str, Any], default_env: str) -> RepoTarget:
     env = str(prof.get("env", default_env))
+    author = str(prof["author"]) if "author" in prof else None
     if "repo" in prof:
-        return RepoTarget(default_env=env, path=str(prof["repo"]))
+        return RepoTarget(default_env=env, path=str(prof["repo"]), author=author)
     if "registry" in prof and "blobs" in prof:
         return RepoTarget(
             default_env=env,
@@ -72,6 +75,7 @@ def _target_from_profile(prof: Mapping[str, Any], default_env: str) -> RepoTarge
             blob_url=str(prof["blobs"]),
             cache_dir=str(prof["cache_dir"]) if "cache_dir" in prof else None,
             storage_options=dict(prof.get("storage_options", {})),
+            author=author,
         )
     raise CliError("profile must set 'repo', or both 'registry' and 'blobs'")
 
@@ -130,6 +134,36 @@ def resolve_target(
     raise CliError(
         "no repository configured: pass --repo/--registry+--blobs, set SARTRE_REPO, "
         "run inside a repo, or define a profile in " + str(_config_path(environ))
+    )
+
+
+def resolve_author(
+    *,
+    flag: str | None = None,
+    target: RepoTarget | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the acting author for a mutating command by the precedence ladder.
+
+    Order, highest first: ``--author/--as`` flag › ``SARTRE_AUTHOR`` env › the active
+    profile's ``author`` › the OS user (``getpass.getuser()``). Raises :class:`CliError`
+    if none resolves — attribution is required at the CLI edge (the library defaults to
+    ``"unknown"``, but the CLI does not). A ``getpass`` lookup that raises (no passwd
+    entry) is treated as unresolved, not a crash.
+    """
+    environ = os.environ if environ is None else environ
+    candidate = flag or environ.get("SARTRE_AUTHOR") or (target.author if target else None)
+    if candidate:
+        return candidate
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no OS user available → fall through to the clean error
+        user = ""
+    if user:
+        return user
+    raise CliError(
+        "no author for this change: pass --author/--as, set SARTRE_AUTHOR, "
+        "or add 'author' to your profile"
     )
 
 

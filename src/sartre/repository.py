@@ -25,7 +25,7 @@ from sartre.fs import SnapshotFS
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
 from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
 from sartre.paths import check_no_case_collisions, normalize_path
-from sartre.ports import DEFAULT_LEASE_TTL, LogEntry, Registry, Store
+from sartre.ports import DEFAULT_LEASE_TTL, LogEntry, PointerMove, Registry, Store
 
 
 def _pointer_ref(pointer: str) -> Ref:
@@ -158,6 +158,8 @@ class Repository:
         *,
         pointer: str = "head",
         metadata: Mapping[str, object] | None = None,
+        actor: str = "unknown",
+        reason: str | None = None,
     ) -> Version:
         """Full-replacement, fail-fast publish: hash → lease → blobs → manifest → CAS.
 
@@ -171,6 +173,11 @@ class Repository:
         step — the lease is re-verified live immediately before ``commit`` and again
         before the pointer CAS, aborting with :class:`LeaseExpired` (retryable) if it
         lapsed. See the repository-facade and garbage-collection capabilities.
+
+        ``actor``/``reason`` are change provenance: they are stamped on the tip event when
+        the new version becomes the pointer's tip (the ``set_pointer`` CAS), NOT baked into
+        the shared manifest. ``actor`` defaults to ``"unknown"``; ``reason`` is free text
+        and is never written into ``metadata``.
         """
         # Canonicalize paths and reject case-collisions up front (write-time path model).
         normalized = {normalize_path(path): src for path, src in files.items()}
@@ -216,7 +223,9 @@ class Repository:
             committed = self.registry.commit(coord, entries, dict(metadata or {}))
             if not self.registry.renew_lease(lease, self._lease_ttl):  # self-check before advance
                 raise LeaseExpired("publish lease lapsed before pointer advance; retry")
-            self.registry.set_pointer(coord, pointer, committed, expected=start)  # CAS
+            self.registry.set_pointer(  # CAS; stamps provenance on the tip event
+                coord, pointer, committed, expected=start, actor=actor, reason=reason
+            )
             return committed
         finally:
             stop.set()
@@ -315,7 +324,14 @@ class Repository:
     # --- pointer plane & enumeration (promotion/rollback + read-only listing) ---
 
     def point(
-        self, coord: Coordinate, name: str, version: Version, *, expected: Version | None
+        self,
+        coord: Coordinate,
+        name: str,
+        version: Version,
+        *,
+        expected: Version | None,
+        actor: str = "unknown",
+        reason: str | None = None,
     ) -> None:
         """Move a mutable pointer (head or a named alias) to a committed ``version``.
 
@@ -324,8 +340,12 @@ class Repository:
         equals ``expected`` (``None`` requires it to be unset), raising
         :class:`~sartre.errors.Conflict` otherwise, and :class:`~sartre.errors.NotFound`
         if ``version`` is not a committed version. The promotion/rollback primitive.
+        ``actor``/``reason`` record who moved the pointer and why in the pointer-move
+        history (and on the tip event); ``actor`` defaults to ``"unknown"``.
         """
-        self.registry.set_pointer(coord, name, version, expected=expected)
+        self.registry.set_pointer(
+            coord, name, version, expected=expected, actor=actor, reason=reason
+        )
 
     def list_coordinates(self) -> Sequence[Coordinate]:
         """Every coordinate the registry holds (no blob fetch)."""
@@ -338,6 +358,10 @@ class Repository:
     def list_pointers(self, coord: Coordinate) -> Mapping[str, Version]:
         """A coordinate's mutable pointers as ``name -> version`` (no blob fetch)."""
         return self.registry.list_pointers(coord)
+
+    def list_pointer_history(self, coord: Coordinate) -> Sequence[PointerMove]:
+        """A coordinate's append-only pointer-move history, oldest first (no blob fetch)."""
+        return self.registry.list_pointer_history(coord)
 
 
 class AsyncRepository:

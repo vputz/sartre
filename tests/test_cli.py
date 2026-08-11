@@ -102,11 +102,11 @@ class _RaceOnceRepo:
     def head(self, *a: object, **k: object):  # noqa: ANN202
         return self._inner.head(*a, **k)  # type: ignore[arg-type]
 
-    def point(self, coord, name, version, *, expected):  # noqa: ANN001, ANN202
+    def point(self, coord, name, version, *, expected, actor="unknown", reason=None):  # noqa: ANN001, ANN202
         if not self._raced:
             self._raced = True
             raise Conflict("raced")
-        self._inner.point(coord, name, version, expected=expected)
+        self._inner.point(coord, name, version, expected=expected, actor=actor, reason=reason)
 
 
 def test_move_pointer_force_retries_past_conflict(repo: Repository) -> None:

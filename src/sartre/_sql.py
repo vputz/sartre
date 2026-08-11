@@ -24,7 +24,7 @@ from typing import Any
 from sartre.errors import Conflict, NotFound
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
 from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
-from sartre.ports import DEFAULT_LEASE_TTL, LeaseId, LogEntry
+from sartre.ports import DEFAULT_LEASE_TTL, LeaseId, LogEntry, PointerMove
 
 # A DB-API connection (sqlite3 or psycopg); typed loosely since the two drivers'
 # overloaded signatures don't share a nominal protocol. Only execute/cursor are used.
@@ -77,7 +77,12 @@ class _SqlRegistry:
             "version TEXT NOT NULL, PRIMARY KEY (coord_name, coord_env, name))",
             f"CREATE TABLE IF NOT EXISTS log (seq {self._SEQ_TYPE}, "
             "coord_name TEXT NOT NULL, coord_env TEXT NOT NULL, version TEXT NOT NULL, "
-            "pointer TEXT NOT NULL, created_at TEXT NOT NULL)",
+            "pointer TEXT NOT NULL, created_at TEXT NOT NULL, "
+            "actor TEXT NOT NULL DEFAULT 'unknown', reason TEXT)",
+            f"CREATE TABLE IF NOT EXISTS pointer_moves (move_seq {self._SEQ_TYPE}, "
+            "coord_name TEXT NOT NULL, coord_env TEXT NOT NULL, pointer TEXT NOT NULL, "
+            "from_version TEXT, to_version TEXT NOT NULL, "
+            "actor TEXT NOT NULL, reason TEXT, at TEXT NOT NULL)",
             f"CREATE TABLE IF NOT EXISTS leases (lease_id {self._SEQ_TYPE}, "
             f"version TEXT NOT NULL, hashes TEXT NOT NULL, expires_at {self._TS_TYPE} NOT NULL)",
         ]
@@ -189,12 +194,38 @@ class _SqlRegistry:
         with self._lock:
             rows = self._exec(
                 self._conn,
-                "SELECT version, seq, created_at FROM log "
+                "SELECT version, seq, created_at, actor, reason FROM log "
                 "WHERE coord_name=? AND coord_env=? ORDER BY seq",
                 (coord.name, coord.env),
             ).fetchall()
             return [
-                LogEntry(version=r[0], seq=r[1], created_at=datetime.fromisoformat(r[2]))
+                LogEntry(
+                    version=r[0],
+                    seq=r[1],
+                    created_at=datetime.fromisoformat(r[2]),
+                    actor=r[3],
+                    reason=r[4],
+                )
+                for r in rows
+            ]
+
+    def list_pointer_history(self, coord: Coordinate) -> Sequence[PointerMove]:
+        with self._lock:
+            rows = self._exec(
+                self._conn,
+                "SELECT pointer, from_version, to_version, actor, reason, at "
+                "FROM pointer_moves WHERE coord_name=? AND coord_env=? ORDER BY move_seq",
+                (coord.name, coord.env),
+            ).fetchall()
+            return [
+                PointerMove(
+                    name=r[0],
+                    from_version=r[1],
+                    to_version=r[2],
+                    actor=r[3],
+                    reason=r[4],
+                    at=datetime.fromisoformat(r[5]),
+                )
                 for r in rows
             ]
 
@@ -224,7 +255,14 @@ class _SqlRegistry:
         return version
 
     def set_pointer(
-        self, coord: Coordinate, name: str, version: Version, *, expected: Version | None
+        self,
+        coord: Coordinate,
+        name: str,
+        version: Version,
+        *,
+        expected: Version | None,
+        actor: str = "unknown",
+        reason: str | None = None,
     ) -> None:
         with self._tx() as conn:
             if self._exec(
@@ -250,11 +288,18 @@ class _SqlRegistry:
                 raise Conflict(
                     f"pointer {name!r} for {coord} did not match expected {expected}"
                 )
-            self._exec(
+            now = datetime.now(UTC).isoformat()
+            self._exec(  # tip event: stamps who/why on the commit-log row
                 conn,
-                "INSERT INTO log(coord_name, coord_env, version, pointer, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (coord.name, coord.env, version, name, datetime.now(UTC).isoformat()),
+                "INSERT INTO log(coord_name, coord_env, version, pointer, created_at, "
+                "actor, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (coord.name, coord.env, version, name, now, actor, reason),
+            )
+            self._exec(  # append-only provenance audit; from_version = prior value (expected)
+                conn,
+                "INSERT INTO pointer_moves(coord_name, coord_env, pointer, from_version, "
+                "to_version, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (coord.name, coord.env, name, expected, version, actor, reason, now),
             )
 
     def drop_version(self, version: Version) -> None:

@@ -12,7 +12,7 @@ Every mutating change SHALL record two provenance fields — `actor` (an attribu
 - **THEN** neither is written into the manifest `metadata`, which remains reserved for domain payload
 
 ### Requirement: Commits are attributed
-Committing a new version into a coordinate SHALL record the committing `actor` and the `reason` on that coordinate's commit-log event, alongside the version, sequence, and time. The reason SHALL be the single free-text field for a commit; there SHALL be no separate `message` metadata key.
+Publishing a version as a coordinate's tip SHALL record the acting `actor` and the `reason` on that coordinate's commit-log (tip) event, alongside the version, sequence, and time. Provenance is written when a version becomes a tip (the pointer move), not on the shared manifest; a manifest committed but never made a tip carries no attribution. The reason SHALL be the single free-text field for the change; there SHALL be no separate `message` metadata key.
 
 #### Scenario: A commit records who and why
 - **WHEN** a version is published with `actor="alice"` and `reason="retrain on Q3 data"`

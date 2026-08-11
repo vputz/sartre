@@ -43,7 +43,7 @@ from sartre.model import (
     Version,
 )
 from sartre.paths import check_no_case_collisions, normalize_path
-from sartre.ports import BlobBackend, LeaseId, LogEntry, Registry, Store
+from sartre.ports import BlobBackend, LeaseId, LogEntry, PointerMove, Registry, Store
 from sartre.postgres import PostgresRegistry
 from sartre.repository import AsyncRepository, GCResult, Repository, RetentionPolicy
 from sartre.sqlite import SqliteRegistry
@@ -73,6 +73,7 @@ __all__ = [
     "NotFound",
     "PathError",
     "Pin",
+    "PointerMove",
     "PostgresRegistry",
     "Ref",
     "Registry",
