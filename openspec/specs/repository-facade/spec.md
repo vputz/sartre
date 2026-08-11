@@ -4,7 +4,7 @@
 TBD - created by archiving change add-core-ports. Update Purpose after archive.
 ## Requirements
 ### Requirement: Repository composes a Registry and a Store
-The system SHALL provide a `Repository` facade constructed from one `Registry` and one `Store`. The facade SHALL expose the read surface — `head`, `resolve`, `open(snap, path)`, `fetch_all(snap)` — a `snapshot_fs(snap)` factory returning a read-only fsspec filesystem bound to that snapshot, a `checkout(snap, dest)` operation materializing the whole tree under a caller-chosen directory, a `publish` operation, and a `gc(policy) -> GCResult` operation reclaiming storage by mark-and-sweep, delegating manifest concerns to the registry and byte concerns to the store.
+The system SHALL provide a `Repository` facade constructed from one `Registry` and one `Store`. The facade SHALL expose the read surface — `head`, `resolve`, `open(snap, path)`, `fetch_all(snap)` — a `snapshot_fs(snap)` factory returning a read-only fsspec filesystem bound to that snapshot, a `checkout(snap, dest)` operation materializing the whole tree under a caller-chosen directory, a `publish` operation, a `point(coord, name, version, *, expected)` compare-and-swap pointer move, thin enumeration delegators (`list_coordinates()`, `list_log(coord)`, `list_pointers(coord)`), and a `gc(policy) -> GCResult` operation reclaiming storage by mark-and-sweep, delegating manifest concerns to the registry and byte concerns to the store.
 
 #### Scenario: Open materializes one entry
 - **WHEN** `open(snap, path)` is called
@@ -24,7 +24,11 @@ The system SHALL provide a `Repository` facade constructed from one `Registry` a
 
 #### Scenario: GC reclaims through the facade
 - **WHEN** `gc(policy)` is called
-- **THEN** the facade computes roots via the registry, sweeps unreferenced blobs via the store, and returns a result describing what was dropped
+- **THEN** it reclaims unreferenced blobs and out-of-retention manifests via mark-and-sweep and reports what was dropped
+
+#### Scenario: Enumeration delegates to the registry
+- **WHEN** `list_coordinates()`, `list_log(coord)`, or `list_pointers(coord)` is called
+- **THEN** it returns the registry's coordinates, commit log, or pointer map without fetching any blob
 
 ### Requirement: Publish holds a blob lease
 `Repository.publish` SHALL acquire a lease over its version and blob hashes, with a TTL,
@@ -85,4 +89,19 @@ The system SHALL provide an `AsyncRepository` that wraps the synchronous core, o
 #### Scenario: Async call does not block the event loop
 - **WHEN** an async application awaits a repository read
 - **THEN** the synchronous work runs off the event loop thread and the loop remains responsive
+
+### Requirement: Compare-and-swap pointer move
+The `Repository` SHALL provide `point(coord, name, version, *, expected)` that moves a mutable pointer (head or a named alias) to an already-committed `version`, changing only the pointer plane — no blob upload and no new manifest. It SHALL delegate to the registry's compare-and-swap `set_pointer`, so it advances only if the pointer's current value equals `expected` and raises a typed conflict otherwise; `expected=None` requires the pointer to not already exist. It SHALL raise `NotFound` if `version` is not a committed version. This is the promotion/rollback primitive: promote an existing version to a channel, re-point an alias, or move head back.
+
+#### Scenario: Move a pointer to a committed version
+- **WHEN** `point(coord, "stable", v, expected=current)` is called and `v` is committed and the pointer currently equals `current`
+- **THEN** the `stable` pointer advances to `v` and no blob is uploaded
+
+#### Scenario: Stale expected is rejected
+- **WHEN** `point` is called with an `expected` that no longer matches the pointer's current value
+- **THEN** it raises a typed conflict and leaves the pointer unchanged
+
+#### Scenario: Refuse to point at an uncommitted version
+- **WHEN** `point` targets a version that has not been committed
+- **THEN** it raises `NotFound` and does not move the pointer
 
