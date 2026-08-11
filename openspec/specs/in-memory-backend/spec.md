@@ -5,7 +5,6 @@ Define the ephemeral, single-process reference backend that makes the blob and
 manifest ports runnable end-to-end. It is the executable oracle for the port
 contracts — suitable for tests and local use — and the substrate against which
 the publish-transaction invariants are property-checked on live code.
-
 ## Requirements
 ### Requirement: In-memory reference backend
 The library SHALL provide an ephemeral, single-process reference backend — a
@@ -60,3 +59,11 @@ live system: the tip is always a committed manifest whose blobs are all present
   interrupted-and-retried publishes
 - **THEN** in every observed state the current tip resolves to a fully present
   manifest, matching the `PointerSafe` invariant verified by the TLA+ model
+
+### Requirement: In-memory backend mirrors change provenance
+The in-memory reference backend SHALL record commit `actor`/`reason` on its per-coordinate commit log and SHALL maintain an in-memory append-only pointer-move history, so that `list_log` and `list_pointer_history` behave identically to the persistent backend. This keeps the reference backend a faithful oracle for differential testing of provenance.
+
+#### Scenario: Reference backend reports commit and move provenance
+- **WHEN** a version is committed and a pointer moved with an actor and reason against the in-memory backend
+- **THEN** `list_log` exposes the commit's actor/reason and `list_pointer_history` exposes the move's from/to versions, actor, reason, and time — matching the persistent backend for the same sequence
+
