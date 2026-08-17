@@ -59,11 +59,15 @@ Because S3 exposes no registry clock, `S3Registry` SHALL implement the lease sur
 - **THEN** the in-flight blobs are retained by blob-grace, the freshly pointed version is retained by reachability, and no in-use data is reclaimed
 
 ### Requirement: Safe version reclamation under concurrent promotion
-`drop_version` on the transaction-less S3 backend SHALL be safe against a concurrent `set_pointer` that targets the same version: it SHALL NOT leave a pointer referencing a reclaimed manifest. The closure SHALL be a TLA-verified protocol (a shared put-if-absent marker serializing drop against promote, or an equivalent the model proves sufficient). `set_pointer` SHALL refuse to advance to a version undergoing reclamation.
+`drop_version` on the transaction-less S3 backend SHALL be safe against a concurrent `set_pointer` that targets the same version: no reader SHALL ever resolve a pointer to a reclaimed manifest. Because appended pointer events are immutable and cannot be retracted, the closure SHALL make a raced event harmless rather than prevent it: `drop_version` SHALL write the version tombstone **before** deleting the manifest object, and `head`/`resolve`/`list_pointers` SHALL skip a tombstoned tail target, reverting to the pointer's most recent non-tombstoned version (or treating it as unset). `set_pointer` SHALL refuse to advance to a tombstoned version. This protocol, and the necessity of both its halves, SHALL be verified in a TLA+ model.
 
 #### Scenario: Promote racing a drop never dangles
 - **WHEN** `drop_version(v)` and `set_pointer(name, v, …)` run concurrently for an out-of-retention `v`
-- **THEN** either the promotion wins and the version is retained (drop aborts), or the drop wins and the promotion raises `NotFound` — never a pointer left targeting a reclaimed manifest
+- **THEN** the pointer resolves either to `v` (promotion won, drop refused) or to its prior valid version / unset (drop won) — never to a reclaimed manifest
+
+#### Scenario: Reads revert past a reclaimed tail target
+- **WHEN** a pointer's newest event targets a version that is later tombstoned and its manifest deleted
+- **THEN** `head` and `resolve` return the pointer's most recent non-tombstoned version, or raise `NotFound` if none remains
 
 ### Requirement: Behavioral equivalence to the reference backend
 `S3Registry` SHALL be differentially tested against the in-memory reference backend over the same operation sequences, agreeing on pointer resolution, version enumeration, and commit/move provenance — modulo the append-only history semantics (tombstoned versions excluded from enumeration; event objects retained). The differential harness MAY run against an in-process S3 emulator that models conditional writes.
@@ -72,13 +76,17 @@ Because S3 exposes no registry clock, `S3Registry` SHALL implement the lease sur
 - **WHEN** the same sequence of commits, pointer moves, and drops is applied to the reference backend and `S3Registry`
 - **THEN** `head`, `resolve`, `list_pointers`, and `list_versions` agree at every step, and `list_log`/`list_pointer_history` agree modulo retained-but-tombstoned history
 
-### Requirement: One-URL opener with a conditional-write probe
-The system SHALL provide `open_s3(url, *, blob_url=None, storage_options=None, cache_dir=None) -> Repository` assembling an `S3Registry` and an S3 blob `Store` from a single bucket URL (blobs default to a sibling prefix; `blob_url` splits the planes), reusing one fsspec configuration. `open_s3` SHALL probe the endpoint for conditional-write support and SHALL raise a clear error if the endpoint does not enforce put-if-absent.
+### Requirement: One-URL opener with lazy conditional-write verification
+The system SHALL provide `open_s3(url, *, blob_url=None, storage_options=None, cache_dir=None) -> Repository` assembling an `S3Registry` and an S3 blob `Store` from a single bucket URL (blobs default to a sibling prefix; `blob_url` splits the planes), reusing one fsspec configuration. The registry SHALL verify conditional-write (put-if-absent) support lazily — once, on its first write operation — and SHALL raise a clear error if the endpoint does not enforce it. It SHALL NOT verify on read paths, so read-only credentials can run read-only commands and no probe object is written per command.
 
 #### Scenario: Single-URL open round-trips
 - **WHEN** `open_s3("s3://bucket/repo")` publishes an artifact and later resolves it
 - **THEN** the manifest is served from `repo/` object state and the blobs from the `repo/blobs` plane
 
-#### Scenario: Non-conforming endpoint is rejected
-- **WHEN** `open_s3` targets an S3-compatible endpoint that does not enforce `If-None-Match:*`
+#### Scenario: Read-only usage does not require write access
+- **WHEN** a repository is opened and only read operations (`head`/`resolve`/`ls`) are performed
+- **THEN** no conditional-write probe object is written and no write permission is exercised
+
+#### Scenario: Non-conforming endpoint is rejected on first write
+- **WHEN** the first `commit`/`set_pointer` runs against an S3-compatible endpoint that does not enforce `If-None-Match:*`
 - **THEN** it raises an error naming the missing conditional-write support rather than operating unsafely

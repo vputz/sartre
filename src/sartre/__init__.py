@@ -46,6 +46,7 @@ from sartre.paths import check_no_case_collisions, normalize_path
 from sartre.ports import BlobBackend, LeaseId, LogEntry, PointerMove, Registry, Store
 from sartre.postgres import PostgresRegistry
 from sartre.repository import AsyncRepository, GCResult, Repository, RetentionPolicy
+from sartre.s3 import S3Registry, open_s3
 from sartre.sqlite import SqliteRegistry
 from sartre.store import CachingStore, CasStore, FsspecBlobBackend
 
@@ -83,7 +84,9 @@ __all__ = [
     "Sha256Hasher",
     "Snapshot",
     "SnapshotFS",
+    "S3Registry",
     "SqliteRegistry",
+    "open_s3",
     "Store",
     "Version",
     "algorithm_of",

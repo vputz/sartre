@@ -23,7 +23,7 @@ from typing import Any
 
 from sartre.errors import Conflict, NotFound
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
-from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
+from sartre.model import HEAD, Coordinate, Entry, Hash, Pin, Ref, Snapshot, Version, pointer_name
 from sartre.ports import DEFAULT_LEASE_TTL, LeaseId, LogEntry, PointerMove
 
 # A DB-API connection (sqlite3 or psycopg); typed loosely since the two drivers'
@@ -99,14 +99,6 @@ class _SqlRegistry:
         cur = conn.cursor()
         cur.executemany(self._q(sql), list(seq))
 
-    @staticmethod
-    def _pointer_name(ref: Ref) -> str:
-        if isinstance(ref, Head):
-            return "head"
-        if isinstance(ref, Alias):
-            return ref.name
-        raise TypeError(f"not a pointer ref: {ref!r}")
-
     def _resolve_ref(self, coord: Coordinate, ref: Ref) -> Version:
         if isinstance(ref, Pin):
             row = self._exec(
@@ -117,7 +109,7 @@ class _SqlRegistry:
             if row is None:
                 raise NotFound(f"version {ref.version} not known for {coord}")
             return ref.version
-        name = self._pointer_name(ref)
+        name = pointer_name(ref)
         row = self._exec(
             self._conn,
             "SELECT version FROM pointers WHERE coord_name=? AND coord_env=? AND name=?",

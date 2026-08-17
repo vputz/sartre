@@ -18,6 +18,12 @@ from sartre.cli.errors import CliError
 from sartre.cloud import open_cloud
 from sartre.local import open_local
 from sartre.repository import Repository
+from sartre.s3 import open_s3
+
+
+def _is_object_url(path: str) -> bool:
+    """A remote fsspec URL (s3://, gs://, …) as opposed to a local path or file://."""
+    return "://" in path and not path.startswith("file://")
 
 _FALLBACK_ENV = "dev"
 _REPO_MARKER = "registry.db"  # the open_local layout marker used for cwd auto-detect
@@ -37,7 +43,9 @@ class RepoTarget:
 
     @property
     def kind(self) -> str:
-        return "local" if self.path is not None else "cloud"
+        if self.path is not None:
+            return "cloud" if _is_object_url(self.path) else "local"
+        return "cloud"
 
 
 def _config_path(environ: Mapping[str, str]) -> Path:
@@ -64,18 +72,17 @@ def _detect_local(cwd: Path) -> str | None:
 
 
 def _target_from_profile(prof: Mapping[str, Any], default_env: str) -> RepoTarget:
-    env = str(prof.get("env", default_env))
-    author = str(prof["author"]) if "author" in prof else None
-    if "repo" in prof:
-        return RepoTarget(default_env=env, path=str(prof["repo"]), author=author)
+    common: dict[str, Any] = {  # shared across the local/object-URL and cloud shapes
+        "default_env": str(prof.get("env", default_env)),
+        "author": str(prof["author"]) if "author" in prof else None,
+        "cache_dir": str(prof["cache_dir"]) if "cache_dir" in prof else None,
+        "storage_options": dict(prof.get("storage_options", {})),
+    }
+    if "repo" in prof:  # a path or an object-store URL (open_target routes s3:// via open_s3)
+        return RepoTarget(path=str(prof["repo"]), **common)
     if "registry" in prof and "blobs" in prof:
         return RepoTarget(
-            default_env=env,
-            registry_dsn=str(prof["registry"]),
-            blob_url=str(prof["blobs"]),
-            cache_dir=str(prof["cache_dir"]) if "cache_dir" in prof else None,
-            storage_options=dict(prof.get("storage_options", {})),
-            author=author,
+            registry_dsn=str(prof["registry"]), blob_url=str(prof["blobs"]), **common
         )
     raise CliError("profile must set 'repo', or both 'registry' and 'blobs'")
 
@@ -95,7 +102,7 @@ def resolve_target(
     cwd = Path.cwd() if cwd is None else cwd
     default_env = env or environ.get("SARTRE_ENV") or _FALLBACK_ENV
 
-    if registry is not None and blobs is None or registry is None and blobs is not None:
+    if (registry is None) != (blobs is None):  # exactly one given → misconfigured
         raise CliError("--registry and --blobs must be given together")
 
     # 1. explicit flags
@@ -170,6 +177,12 @@ def resolve_author(
 def open_target(target: RepoTarget) -> Repository:
     """Open the resolved target, inferring local vs cloud from which fields are set."""
     if target.path is not None:
+        if _is_object_url(target.path):  # e.g. --repo s3://bucket/repo → object-store registry
+            return open_s3(
+                target.path,
+                storage_options=dict(target.storage_options),
+                cache_dir=target.cache_dir,
+            )
         return open_local(target.path)
     assert target.registry_dsn is not None and target.blob_url is not None
     return open_cloud(

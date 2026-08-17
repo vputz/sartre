@@ -19,7 +19,7 @@ from typing import Any
 
 from sartre.errors import Conflict, NotFound
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
-from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
+from sartre.model import HEAD, Coordinate, Entry, Hash, Pin, Ref, Snapshot, Version, pointer_name
 from sartre.ports import DEFAULT_LEASE_TTL, LeaseId, LogEntry, PointerMove
 
 
@@ -73,13 +73,6 @@ class MemoryRegistry:
         """Read-only lookup — never materializes an empty coordinate."""
         return self._coords.get((coord.name, coord.env))
 
-    def _pointer_name(self, ref: Ref) -> str:
-        if isinstance(ref, Head):
-            return "head"
-        if isinstance(ref, Alias):
-            return ref.name
-        raise TypeError(f"not a pointer ref: {ref!r}")
-
     def _resolve_ref(self, coord: Coordinate, ref: Ref) -> Version:
         state = self._peek(coord)
         if state is None:
@@ -88,7 +81,7 @@ class MemoryRegistry:
             if ref.version not in {e.version for e in state.log}:
                 raise NotFound(f"version {ref.version} not known for {coord}")
             return ref.version
-        name = self._pointer_name(ref)
+        name = pointer_name(ref)
         if name not in state.pointers:
             raise NotFound(f"pointer {name!r} not set for {coord}")
         return state.pointers[name]

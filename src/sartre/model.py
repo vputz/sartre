@@ -65,6 +65,15 @@ type Ref = Head | Alias | Pin
 HEAD: Head = Head()
 
 
+def pointer_name(ref: Ref) -> str:
+    """The mutable-pointer name a ``Head``/``Alias`` addresses (``Pin`` is not a pointer)."""
+    if isinstance(ref, Head):
+        return "head"
+    if isinstance(ref, Alias):
+        return ref.name
+    raise TypeError(f"not a pointer ref: {ref!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class Entry:
     """One logical file in a manifest: a path, its content hash, and size.
