@@ -98,7 +98,12 @@ class Repository:
         raise NotFound(f"no entry {path!r} in {snap.coord} @ {snap.version}")
 
     def _materialize(self, entry: Entry, dest: Path) -> Path:
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        except (NotADirectoryError, FileExistsError) as exc:  # a file blocks the entry's path
+            raise PathError(
+                f"cannot place {entry.path!r}: an existing file blocks its parent directory"
+            ) from exc
         if entry.inline is not None:  # small files served from the manifest row
             dest.write_bytes(entry.inline)
             return dest
@@ -148,7 +153,9 @@ class Repository:
         are written (overwriting collisions) and pre-existing extraneous files are left in
         place; it is not a sync/mirror and never deletes files absent from the version.
         """
-        if not overwrite and dest.exists() and (not dest.is_dir() or any(dest.iterdir())):
+        if dest.exists() and not dest.is_dir():  # a file/symlink can't be checked out onto
+            raise PathError(f"destination {dest} exists and is not a directory")
+        if not overwrite and dest.exists() and any(dest.iterdir()):
             raise PathError(
                 f"destination {dest} is not empty; checkout refuses to overlay by default — "
                 "use a fresh directory, or pass overwrite=True (CLI: --force) to overlay"
@@ -229,9 +236,12 @@ class Repository:
         beat = threading.Thread(target=_heartbeat, name="sartre-lease-heartbeat", daemon=True)
         beat.start()
         try:
-            for src in normalized.values():  # pass 2: stream each source to the store
+            hash_by_path = {entry.path: entry.content_hash for entry in entries}
+            for path, src in normalized.items():  # pass 2: stream each source to the store
                 with _source_stream(src) as stream:
-                    self.store.put(stream)  # streaming stage+promote (idempotent, dedup by hash)
+                    # known_hash skips upload + re-hash for blobs the durable store already
+                    # holds (they are lease-protected); absent blobs stream stage→promote.
+                    self.store.put(stream, known_hash=hash_by_path[path])
             if not self.registry.renew_lease(lease, self._lease_ttl):  # self-check before commit
                 raise LeaseExpired("publish lease lapsed before commit; retry")
             committed = self.registry.commit(coord, entries, dict(metadata or {}))

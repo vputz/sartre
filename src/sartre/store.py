@@ -170,13 +170,18 @@ class CasStore(Store):
     def has(self, content_hash: Hash) -> bool:
         return self.backend.exists(content_hash)
 
-    def put(self, data: BinaryIO) -> Hash:
+    def put(self, data: BinaryIO, *, known_hash: Hash | None = None) -> Hash:
         """Stream ``data`` to the backend and return its content hash. Bounded memory.
 
-        The hash is unknown until the bytes are read, so a hashing tee rides the single
-        streaming pass into staging; ``promote`` then names the blob by its hash (and
-        discards the staging object when identical content is already present).
+        If ``known_hash`` is supplied and the backend already holds it, skip the upload
+        entirely (wire-level dedup) and return it. Otherwise the hash is unknown until the
+        bytes are read, so a hashing tee rides the single streaming pass into staging;
+        ``promote`` then names the blob by its hash (and discards the staging object when
+        identical content is already present). ``known_hash`` is only a skip hint — a blob
+        that is actually uploaded is always named by its true bytes, never by ``known_hash``.
         """
+        if known_hash is not None and self.backend.exists(known_hash):
+            return known_hash
         reader = _HashingReader(data, self.hasher)
         staging_key = self.backend.stage(cast(BinaryIO, reader))  # only .read() is used
         key = reader.key()
@@ -266,11 +271,13 @@ class CachingStore(Store):
         self._ensure_local(content_hash)
         return self.local.get_to(content_hash, dest)
 
-    def put(self, data: BinaryIO) -> Hash:
+    def put(self, data: BinaryIO, *, known_hash: Hash | None = None) -> Hash:
         # Stream to remote (the source of truth) in bounded memory; the local cache is
         # populated lazily on first read (see _ensure_local), so a large publish does not
-        # re-download its own blob just to warm the cache.
-        return self.remote.put(data)
+        # re-download its own blob just to warm the cache. Forward ``known_hash`` so the
+        # dedup skip is tested against the DURABLE remote (via its backend.exists), never
+        # the local cache — a locally-cached but remote-absent blob is still uploaded.
+        return self.remote.put(data, known_hash=known_hash)
 
     def delete(self, content_hash: Hash) -> None:
         if self.local.has(content_hash):

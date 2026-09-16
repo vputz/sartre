@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
+
+import pytest
 
 import sartre
 
@@ -16,4 +18,8 @@ def test_version_is_non_empty_pep440_ish() -> None:
 
 
 def test_version_matches_distribution_when_installed() -> None:
-    assert sartre.__version__ == version("sartre")
+    try:
+        dist = version("sartre")
+    except PackageNotFoundError:
+        pytest.skip("sartre has no installed distribution metadata (raw checkout)")
+    assert sartre.__version__ == dist

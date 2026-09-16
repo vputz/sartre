@@ -52,7 +52,7 @@ class _RaisingStore:
     def get_to(self, content_hash: Hash, dest: Path) -> Path:
         raise AssertionError("listing must not fetch blobs")
 
-    def put(self, data: BinaryIO) -> Hash:
+    def put(self, data: BinaryIO, *, known_hash: Hash | None = None) -> Hash:
         raise AssertionError("read-only view")
 
     def delete(self, content_hash: Hash) -> None:
@@ -82,8 +82,8 @@ class _CountingRemote:
     def get_to(self, content_hash: Hash, dest: Path) -> Path:
         return self.inner.get_to(content_hash, dest)
 
-    def put(self, data: BinaryIO) -> Hash:
-        return self.inner.put(data)
+    def put(self, data: BinaryIO, *, known_hash: Hash | None = None) -> Hash:
+        return self.inner.put(data, known_hash=known_hash)
 
     def delete(self, content_hash: Hash) -> None:
         self.inner.delete(content_hash)

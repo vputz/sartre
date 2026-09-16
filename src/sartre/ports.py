@@ -235,8 +235,16 @@ class Store(Protocol):
         """Materialize a blob to a local path and return it."""
         ...
 
-    def put(self, data: BinaryIO) -> Hash:
-        """Store bytes and return their self-describing content hash. Idempotent."""
+    def put(self, data: BinaryIO, *, known_hash: Hash | None = None) -> Hash:
+        """Store bytes and return their self-describing content hash. Idempotent.
+
+        ``known_hash`` is an optional wire-dedup *hint*: when given and the store's own
+        **durable** target already holds it, ``put`` returns it without consuming or
+        uploading ``data``. Otherwise ``put`` uploads as usual and names the blob by the
+        hash of its actual bytes — ``known_hash`` is never trusted for naming on the upload
+        path. A caching store MUST test its remote (durable) store for this skip, never a
+        local cache.
+        """
         ...
 
     def delete(self, content_hash: Hash) -> None:

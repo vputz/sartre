@@ -51,3 +51,27 @@ def test_checkout_overwrite_overlays_without_pruning(repo: Repository, tmp_path:
 
     assert out.joinpath("a.txt").read_bytes() == b"A"       # collision overwritten
     assert out.joinpath("stale.txt").read_bytes() == b"OLD"  # overlay, not sync: extraneous kept
+
+
+def test_checkout_onto_a_non_directory_is_refused(repo: Repository, tmp_path: Path) -> None:
+    repo.publish(COORD, {"a.txt": b"A"})
+    snap = repo.resolve(COORD)
+    afile = tmp_path / "afile"
+    afile.write_bytes(b"x")
+
+    with pytest.raises(PathError):  # default
+        repo.checkout(snap, afile)
+    with pytest.raises(PathError):  # --force can't overlay onto a file either
+        repo.checkout(snap, afile, overwrite=True)
+    assert afile.read_bytes() == b"x"  # untouched
+
+
+def test_overlay_file_shadowing_a_dir_raises_patherror(repo: Repository, tmp_path: Path) -> None:
+    repo.publish(COORD, {"d/x.txt": b"X"})
+    snap = repo.resolve(COORD)
+    dest = tmp_path / "out"
+    dest.mkdir()
+    (dest / "d").write_bytes(b"blocker")  # a FILE where the version needs a directory
+
+    with pytest.raises(PathError):  # a clean PathError, not a raw NotADirectoryError traceback
+        repo.checkout(snap, dest, overwrite=True)
