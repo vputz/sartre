@@ -8,6 +8,9 @@ content-hash ↔ bytes), composed by a ``Repository``. See
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
+
 from sartre.cloud import open_cloud
 from sartre.errors import (
     Conflict,
@@ -49,6 +52,11 @@ from sartre.repository import AsyncRepository, GCResult, Repository, RetentionPo
 from sartre.s3 import S3Registry, open_s3
 from sartre.sqlite import SqliteRegistry
 from sartre.store import CachingStore, CasStore, FsspecBlobBackend
+
+try:  # the build's declared version is the single source of truth (pyproject `version`)
+    __version__ = _version("sartre")
+except PackageNotFoundError:  # running from a raw checkout without installed metadata
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "DEFAULT_HASHER",

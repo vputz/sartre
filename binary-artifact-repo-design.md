@@ -7,6 +7,14 @@
 > **Origin:** distilled from a planning session that examined how one production system
 > (an ML signal-training/serving platform, "signalq") stores and retrieves versioned
 > binary artifacts today, and what a unified replacement would look like.
+>
+> **Superseded (implementation note):** the "Delta + S3" framing below was the original
+> plan for the manifest plane. The implemented library instead ships SQL registries
+> (`SqliteRegistry` for local, `PostgresRegistry` for shared) and a native `S3Registry`
+> (shared multi-writer directly on object storage via put-if-absent). No Delta-Lake
+> backend was built and none is planned — the S3-native registry fills that "no database,
+> just object storage" role with a better fit for the port. Read the Delta references
+> here as historical motivation, not a roadmap.
 
 ---
 

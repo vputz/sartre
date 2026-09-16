@@ -38,3 +38,6 @@ MC.out
 
 # OS
 .DS_Store
+
+# stray local scratch (e.g. migration snapshot downloads); not the tests/ dir
+/test/
