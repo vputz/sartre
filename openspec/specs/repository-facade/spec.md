@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change add-core-ports. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Repository composes a Registry and a Store
 The system SHALL provide a `Repository` facade constructed from one `Registry` and one `Store`. The facade SHALL expose the read surface — `head`, `resolve`, `open(snap, path)`, `fetch_all(snap)` — a `snapshot_fs(snap)` factory returning a read-only fsspec filesystem bound to that snapshot, a `checkout(snap, dest)` operation materializing the whole tree under a caller-chosen directory, a `publish` operation, a `point(coord, name, version, *, expected)` compare-and-swap pointer move, thin enumeration delegators (`list_coordinates()`, `list_log(coord)`, `list_pointers(coord)`, `list_pointer_history(coord)`), and a `gc(policy) -> GCResult` operation reclaiming storage by mark-and-sweep, delegating manifest concerns to the registry and byte concerns to the store.
 
@@ -116,3 +118,17 @@ The `Repository.publish` operation SHALL accept `actor` and `reason`, threading 
 - **WHEN** `publish` is called without `actor`
 - **THEN** the commit is recorded with `actor="unknown"` and succeeds
 
+### Requirement: Checkout requires an empty destination by default
+`Repository.checkout(snap, dest, *, overwrite=False)` SHALL materialize the version only into a destination that does not exist or is empty. If `dest` exists and is non-empty and `overwrite` is false, it SHALL raise a typed error (`PathError`) naming the directory and the override, and SHALL write nothing. With `overwrite=True` it SHALL write the manifest's files into `dest`, overwriting any colliding paths and leaving pre-existing extraneous files in place — overlay semantics, not sync: it SHALL NOT delete files absent from the version. `checkout` SHALL NOT provide a prune/mirror mode, because without an index it cannot distinguish its own stale files from the caller's unrelated files. `AsyncRepository.checkout` SHALL expose the same `overwrite` parameter and behavior. `fetch_all`, which uses a fresh temporary directory, is unaffected.
+
+#### Scenario: Fresh or empty destination materializes the exact tree
+- **WHEN** `checkout` targets a nonexistent or empty directory
+- **THEN** every entry is written at its logical path under `dest` and the directory contents equal the version's tree
+
+#### Scenario: Non-empty destination is refused by default
+- **WHEN** `checkout` targets an existing directory that already contains files and `overwrite` is false
+- **THEN** it raises `PathError` naming the directory and writes nothing
+
+#### Scenario: Overwrite overlays without pruning
+- **WHEN** `checkout(..., overwrite=True)` targets a non-empty directory that holds a file not in the version
+- **THEN** the version's files are written (overwriting any collisions) and the extraneous pre-existing file remains — the destination is not reduced to exactly the version

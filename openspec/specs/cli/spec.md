@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change add-cli. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Command-line interface over the library
 The system SHALL provide a `sartre` command-line interface exposing the repository
 lifecycle without writing Python: read commands `show`, `head`, `ls`, `cat`, `log`,
@@ -179,3 +181,13 @@ The `show` and `log` commands SHALL display the commit `actor` and `reason` for 
 - **WHEN** `sartre log m/prod` is run for a coordinate with attributed commits
 - **THEN** each row includes the version's actor and reason
 
+### Requirement: Checkout refuses a non-empty destination unless forced
+`sartre checkout <ref> <dest>` SHALL refuse to write into a destination that already exists and is non-empty, exiting non-zero with a clear message naming the directory and the `--force` override, rather than overlaying silently. A nonexistent or empty destination materializes the version as normal. `--force` SHALL write into a non-empty destination with overlay semantics (manifest files written/overwritten, extraneous files left in place — no pruning).
+
+#### Scenario: Non-empty destination is refused
+- **WHEN** `sartre checkout m/prod ./out` is run and `./out` already contains files
+- **THEN** the command exits non-zero with a message naming `./out` and `--force`, and writes nothing
+
+#### Scenario: Force overlays into a non-empty destination
+- **WHEN** `sartre checkout m/prod ./out --force` is run and `./out` is non-empty
+- **THEN** the version's files are written (overwriting collisions), pre-existing extraneous files remain, and the command succeeds
