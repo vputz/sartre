@@ -56,6 +56,23 @@ def test_publish_show_ls_cat_checkout(tmp_path: Path) -> None:
     assert (dest / "w" / "model.bin").read_bytes() == b"WEIGHTS"
 
 
+def test_checkout_refuses_nonempty_dir_unless_forced(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _run(repo, "publish", "models/prod", str(_ckpt(tmp_path)))
+    dest = tmp_path / "out"
+    dest.mkdir()
+    (dest / "stale").write_bytes(b"x")
+
+    r = _run(repo, "checkout", "models/prod", str(dest))  # default: refuse
+    assert r.exit_code == 1 and "--force" in r.stderr
+    assert not (dest / "cfg.json").exists()  # wrote nothing
+
+    r = _run(repo, "checkout", "models/prod", str(dest), "--force")  # overlay
+    assert r.exit_code == 0
+    assert (dest / "cfg.json").exists()
+    assert (dest / "stale").read_bytes() == b"x"  # overlay leaves extraneous file
+
+
 def test_json_output(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _run(repo, "publish", "models/prod", str(_ckpt(tmp_path)))

@@ -211,13 +211,14 @@ def history(ctx: typer.Context, coord: str = typer.Argument(..., help="name/env"
 def checkout(
     ctx: typer.Context,
     ref: str = typer.Argument(..., help="name/env[:alias|@version]"),
-    dest: Path = typer.Argument(..., help="Destination directory."),
+    dest: Path = typer.Argument(..., help="Destination directory (must be empty or new)."),
+    force: bool = typer.Option(False, "--force", help="Overlay into a non-empty directory."),
 ) -> None:
     """Materialize a whole version under a directory."""
     with _handle():
         target = _target(ctx)
         coord, r = refs.parse_ref(ref, default_env=target.default_env)
-        out = ops.checkout(config.open_target(target), coord, r, dest)
+        out = ops.checkout(config.open_target(target), coord, r, dest, overwrite=force)
         _emit(ctx, f"checked out to {out}", {"dest": str(out)})
 
 

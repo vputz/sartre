@@ -133,12 +133,26 @@ class Repository:
         root = Path(tempfile.mkdtemp(prefix="sartre-fetch-"))
         return self._layout(snap, root, max_workers)
 
-    def checkout(self, snap: Snapshot, dest: Path, *, max_workers: int = 8) -> Path:
+    def checkout(
+        self, snap: Snapshot, dest: Path, *, overwrite: bool = False, max_workers: int = 8
+    ) -> Path:
         """Materialize the whole snapshot under ``dest`` by logical path, in parallel.
 
         Files land at their canonical paths under ``dest`` and nothing is written
         outside it; uncached blobs are fetched concurrently and deduped by the store.
+
+        ``dest`` must not exist or be empty (the clone model): checkout has no index and
+        cannot safely prune, so writing into a populated directory is refused by default —
+        it raises :class:`~sartre.errors.PathError` and writes nothing. ``overwrite=True``
+        writes into a non-empty directory with **overlay** semantics: the version's files
+        are written (overwriting collisions) and pre-existing extraneous files are left in
+        place; it is not a sync/mirror and never deletes files absent from the version.
         """
+        if not overwrite and dest.exists() and (not dest.is_dir() or any(dest.iterdir())):
+            raise PathError(
+                f"destination {dest} is not empty; checkout refuses to overlay by default — "
+                "use a fresh directory, or pass overwrite=True (CLI: --force) to overlay"
+            )
         dest.mkdir(parents=True, exist_ok=True)
         return self._layout(snap, dest, max_workers)
 
@@ -382,8 +396,12 @@ class AsyncRepository:
     async def fetch_all(self, snap: Snapshot, *, max_workers: int = 8) -> Path:
         return await asyncio.to_thread(self._sync.fetch_all, snap, max_workers=max_workers)
 
-    async def checkout(self, snap: Snapshot, dest: Path, *, max_workers: int = 8) -> Path:
-        return await asyncio.to_thread(self._sync.checkout, snap, dest, max_workers=max_workers)
+    async def checkout(
+        self, snap: Snapshot, dest: Path, *, overwrite: bool = False, max_workers: int = 8
+    ) -> Path:
+        return await asyncio.to_thread(
+            self._sync.checkout, snap, dest, overwrite=overwrite, max_workers=max_workers
+        )
 
     async def gc(
         self, policy: RetentionPolicy | None = None, *, clock: Callable[[], datetime] | None = None

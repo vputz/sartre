@@ -140,9 +140,11 @@ def coords(repo: Repository) -> list[dict[str, str]]:
     return [{"name": c.name, "env": c.env} for c in repo.list_coordinates()]
 
 
-def checkout(repo: Repository, coord: Coordinate, ref: Ref, dest: Path) -> Path:
+def checkout(
+    repo: Repository, coord: Coordinate, ref: Ref, dest: Path, *, overwrite: bool = False
+) -> Path:
     snap = repo.resolve(coord, ref)
-    return repo.checkout(snap, dest)
+    return repo.checkout(snap, dest, overwrite=overwrite)
 
 
 # --- write operations ---
