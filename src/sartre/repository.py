@@ -13,7 +13,7 @@ import asyncio
 import io
 import tempfile
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -64,6 +64,18 @@ class GCResult:
 
     dropped_versions: tuple[Version, ...] = field(default_factory=tuple)
     deleted_blobs: tuple[Hash, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class PublishOverResult:
+    """What a :meth:`Repository.publish_over` derive produced — the version and a breakdown."""
+
+    version: Version
+    inherited: int  # base entries carried through unchanged
+    replaced: int   # existing paths overridden by ``changes``
+    added: int      # new paths from ``changes``
+    removed: int    # paths dropped
+    renamed: int    # paths re-keyed (blob reused)
 
 
 class Repository:
@@ -215,18 +227,49 @@ class Repository:
             )
             for path, src in sorted(normalized.items())
         )
-        version = manifest_version(entries, self._hasher)
-        hashes = {entry.content_hash for entry in entries}
-
         try:
             start: Version | None = self.registry.head(coord, _pointer_ref(pointer))
         except NotFound:
             start = None  # first publish to this pointer
+        return self._write_version(
+            coord, entries, normalized, pointer=pointer, expected=start,
+            metadata=metadata, actor=actor, reason=reason,
+        )
+
+    def _write_version(
+        self,
+        coord: Coordinate,
+        entries: tuple[Entry, ...],
+        uploads: Mapping[str, bytes | Path],
+        *,
+        pointer: str,
+        expected: Version | None,
+        metadata: Mapping[str, object] | None,
+        actor: str,
+        reason: str | None,
+    ) -> Version:
+        """Lease → upload the given sources → commit → advance — shared by publish/publish_over.
+
+        ``entries`` is the full manifest; ``uploads`` maps the subset of paths whose bytes
+        must be streamed to the store (all of them for ``publish``; only the changed ones
+        for ``publish_over``). The lease covers *every* entry hash — so reused blobs are GC
+        roots through commit and advance — while only ``uploads`` are streamed (``known_hash``
+        skips any the durable store already holds). Two live self-checks bracket the commit
+        and the pointer CAS, aborting with :class:`LeaseExpired` (retryable) if the lease lapsed.
+
+        ``expected`` is the pointer value the caller's write is predicated on — head-at-write
+        for ``publish`` (full replacement), the base version for a same-lineage ``publish_over``
+        (so a moved pointer conflicts rather than silently overwriting; see ``model/PublishOver
+        .tla``). A mismatch surfaces as :class:`~sartre.errors.Conflict` from the CAS.
+        """
+        version = manifest_version(entries, self._hasher)
+        hashes = {entry.content_hash for entry in entries}
+        hash_by_path = {entry.path: entry.content_hash for entry in entries}
 
         lease = self.registry.acquire_lease(version, hashes, self._lease_ttl)
         stop = threading.Event()
 
-        def _heartbeat() -> None:  # liveness only: keep a long publish's lease from lapsing
+        def _heartbeat() -> None:  # liveness only: keep a long write's lease from lapsing
             while not stop.wait(self._heartbeat_interval):
                 try:
                     self.registry.renew_lease(lease, self._lease_ttl)
@@ -236,25 +279,106 @@ class Repository:
         beat = threading.Thread(target=_heartbeat, name="sartre-lease-heartbeat", daemon=True)
         beat.start()
         try:
-            hash_by_path = {entry.path: entry.content_hash for entry in entries}
-            for path, src in normalized.items():  # pass 2: stream each source to the store
+            for path, src in uploads.items():  # stream only the sources that need uploading
                 with _source_stream(src) as stream:
                     # known_hash skips upload + re-hash for blobs the durable store already
                     # holds (they are lease-protected); absent blobs stream stage→promote.
                     self.store.put(stream, known_hash=hash_by_path[path])
             if not self.registry.renew_lease(lease, self._lease_ttl):  # self-check before commit
-                raise LeaseExpired("publish lease lapsed before commit; retry")
+                raise LeaseExpired("write lease lapsed before commit; retry")
             committed = self.registry.commit(coord, entries, dict(metadata or {}))
             if not self.registry.renew_lease(lease, self._lease_ttl):  # self-check before advance
-                raise LeaseExpired("publish lease lapsed before pointer advance; retry")
+                raise LeaseExpired("write lease lapsed before pointer advance; retry")
             self.registry.set_pointer(  # CAS; stamps provenance on the tip event
-                coord, pointer, committed, expected=start, actor=actor, reason=reason
+                coord, pointer, committed, expected=expected, actor=actor, reason=reason
             )
             return committed
         finally:
             stop.set()
             beat.join(timeout=1.0)
             self.registry.release_lease(lease)
+
+    def publish_over(
+        self,
+        coord: Coordinate,
+        base: Ref = HEAD,
+        *,
+        changes: Mapping[str, bytes | Path] | None = None,
+        remove: Iterable[str] = (),
+        rename: Mapping[str, str] | None = None,
+        pointer: str = "head",
+        metadata: Mapping[str, object] | None = None,
+        actor: str = "unknown",
+        reason: str | None = None,
+    ) -> PublishOverResult:
+        """Derive a new version from ``base``, changing only some paths.
+
+        Seeds the manifest from ``base``'s entries, then applies ``remove`` (drop), ``rename``
+        (re-key an entry to a new path, reusing its blob — no source), and ``changes``
+        (override/add, hashing each source). Every untouched entry is reused **by its existing
+        content hash** — no source, no upload, no re-hash. The result is a new immutable version
+        (``base`` is never mutated); an empty derive, or an override with byte-identical content,
+        yields ``base``'s own version id.
+
+        The advance is compare-and-swap on the value the derive is predicated on: for a
+        same-lineage advance (advancing the very pointer ``base`` names) that is ``base``'s
+        version, so a concurrent move raises :class:`~sartre.errors.Conflict` rather than
+        silently overwriting it (verified in ``model/PublishOver.tla``); otherwise it is the
+        advanced pointer's current value. Removing/renaming a path absent from ``base`` raises
+        :class:`~sartre.errors.PathError`. Returns a :class:`PublishOverResult` with the version
+        and the inherited/replaced/added/removed/renamed counts.
+        """
+        base_snap = self.resolve(coord, base)
+        merged: dict[str, Entry] = {entry.path: entry for entry in base_snap.entries}
+
+        removed = 0
+        for path in remove:
+            key = normalize_path(path)
+            if key not in merged:
+                raise PathError(f"cannot remove {path!r}: not present in the base version")
+            del merged[key]
+            removed += 1
+
+        renamed = 0
+        for old, new in (rename or {}).items():
+            old_key = normalize_path(old)
+            if old_key not in merged:
+                raise PathError(f"cannot rename {old!r}: not present in the base version")
+            e = merged.pop(old_key)
+            new_key = normalize_path(new)
+            merged[new_key] = Entry(new_key, e.content_hash, e.size, e.inline)  # same blob
+            renamed += 1
+
+        uploads: dict[str, bytes | Path] = {}
+        replaced = added = 0
+        for path, src in (changes or {}).items():
+            key = normalize_path(path)
+            replaced, added = (replaced + 1, added) if key in merged else (replaced, added + 1)
+            merged[key] = Entry(key, self._hash_source(src), _source_size(src))
+            uploads[key] = src
+
+        check_no_case_collisions(merged)
+        entries = tuple(merged[key] for key in sorted(merged))
+        inherited = len(entries) - replaced - added - renamed
+
+        # Pin the advance to the base when advancing the very pointer the base names;
+        # otherwise standard CAS on the advanced pointer's current value (None if unset).
+        same_lineage = (isinstance(base, Head) and pointer == "head") or (
+            isinstance(base, Alias) and base.name == pointer
+        )
+        if same_lineage:
+            expected: Version | None = base_snap.version
+        else:
+            try:
+                expected = self.registry.head(coord, _pointer_ref(pointer))
+            except NotFound:
+                expected = None
+
+        version = self._write_version(
+            coord, entries, uploads, pointer=pointer, expected=expected,
+            metadata=metadata, actor=actor, reason=reason,
+        )
+        return PublishOverResult(version, inherited, replaced, added, removed, renamed)
 
     # --- garbage collection ---
 

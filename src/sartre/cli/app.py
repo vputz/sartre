@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,6 +21,7 @@ from sartre.cli import config, ops, refs
 from sartre.cli.duration import parse_duration
 from sartre.cli.errors import CliError
 from sartre.errors import Conflict, IntegrityError, NotFound, PathError
+from sartre.model import Head, Ref
 
 app = typer.Typer(
     name="sartre",
@@ -65,6 +67,46 @@ def _target(ctx: typer.Context) -> config.RepoTarget:
 def _author(target: config.RepoTarget, flag: str | None) -> str:
     """Resolve the required author for a mutating command (flag › env › profile › OS user)."""
     return config.resolve_author(flag=flag, target=target)
+
+
+def _guard_divergent_base(
+    repo: object, coord: object, base_ref: Ref, *, force: bool, message: str | None
+) -> None:
+    """Refuse a `publish-over` whose base isn't the current head unless --force (which needs -m).
+
+    The library already CAS-guards against a silent lost update; this is the CLI making the
+    footgun explicit up front, and — under --force — printing what advancing off an old base
+    discards before writing.
+    """
+    r = repo  # typed loosely: a Repository
+    try:
+        base_version = r.head(coord, base_ref)  # type: ignore[attr-defined]
+    except NotFound:
+        return  # base doesn't resolve — let the derive itself raise a clear NotFound
+    try:
+        head_version = r.head(coord, Head())  # type: ignore[attr-defined]
+    except NotFound:
+        head_version = None
+    if base_version == head_version:
+        return  # deriving from head — the safe, common case
+    if not force:
+        raise CliError(
+            f"base {base_version} is not the current head {head_version}; deriving from it and "
+            "advancing would discard the intervening changes — re-run with --force and -m "
+            "explaining why, or use --from head"
+        )
+    if not message:
+        raise CliError("--force on a non-head base requires -m/--message stating why")
+    try:
+        head_paths = {e.path for e in r.resolve(coord, Head()).entries}  # type: ignore[attr-defined]
+        base_paths = {e.path for e in r.resolve(coord, base_ref).entries}  # type: ignore[attr-defined]
+        dropped = sorted(head_paths - base_paths)
+    except NotFound:
+        dropped = []
+    note = f"discarding: head {head_version} → base {base_version}"
+    if dropped:
+        note += f"; paths in head not in base: {dropped}"
+    typer.secho(note, fg=typer.colors.YELLOW, err=True)
 
 
 def _emit(ctx: typer.Context, human: str, data: Any) -> None:
@@ -252,6 +294,73 @@ def publish(
             pointer=pointer, also_alias=also, metadata=metadata, actor=who, reason=message,
         )
         _emit(ctx, version, {"version": version})
+
+
+@app.command(name="publish-over")
+def publish_over(
+    ctx: typer.Context,
+    coord: str = typer.Argument(..., help="name/env"),
+    sources: list[str] = typer.Argument(None, help="Changed paths: files, dir, or logical=source."),
+    base: str = typer.Option("head", "--from", help="Base ref: head/alias/@version."),
+    remove: list[str] = typer.Option([], "--rm", help="Logical path to drop (repeatable)."),
+    mv: list[str] = typer.Option([], "--mv", help="Rename old:new, reusing the blob (repeatable)."),
+    stage: bool = typer.Option(
+        False, "--stage", help="Land on a fresh staging pointer, not head (deletion pending)."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Advance off a non-head base (needs -m; prints what's discarded)."
+    ),
+    pointer: str = typer.Option("head", "-p", "--pointer", help="Pointer to advance."),
+    also: str | None = typer.Option(None, "--point", help="Also advance this alias."),
+    author: str | None = typer.Option(None, "--author", "--as", help="Who is publishing."),
+    message: str | None = typer.Option(None, "-m", "--message", help="Why (the change reason)."),
+    meta: list[str] = typer.Option([], "--meta", help="Domain metadata key=value (repeatable)."),
+) -> None:
+    """Derive a new version from a base, changing only the given paths (rest inherited)."""
+    with _handle():
+        target = _target(ctx)
+        who = _author(target, author)
+        repo = config.open_target(target)
+        c = refs.parse_coord(coord, default_env=target.default_env)
+        base_ref = refs.parse_source(c, base[1:] if base.startswith("@") else base)
+        rename: dict[str, str] = {}
+        for item in mv:
+            old, sep, new = item.partition(":")
+            if not sep or not old or not new:
+                raise CliError(f"--mv expects old:new, got {item!r}")
+            rename[old] = new
+        metadata: dict[str, Any] = {}
+        for item in meta:
+            if "=" not in item:
+                raise CliError(f"--meta expects key=value, got {item!r}")
+            k, _, v = item.partition("=")
+            metadata[k] = v
+
+        _guard_divergent_base(repo, c, base_ref, force=force, message=message)
+
+        advance = f"staging-{uuid.uuid4().hex[:12]}" if stage else pointer
+        result = ops.publish_over(
+            repo, c, base_ref, ops.gather_sources(sources or []),
+            remove=remove, rename=rename, pointer=advance, also_alias=None if stage else also,
+            metadata=metadata, actor=who, reason=message,
+        )
+        counts = (
+            f"inherited {result.inherited}, replaced {result.replaced}, added {result.added}, "
+            f"removed {result.removed}, renamed {result.renamed}"
+        )
+        human = f"{result.version}\n{counts}"
+        data: dict[str, Any] = {
+            "version": result.version, "inherited": result.inherited,
+            "replaced": result.replaced, "added": result.added,
+            "removed": result.removed, "renamed": result.renamed,
+        }
+        if stage:
+            human += (
+                f"\nstaged at {c.name}/{c.env}:{advance} (head unchanged) — verify it, then:\n"
+                f"  sartre point {c.name}/{c.env} @{result.version}"
+            )
+            data["staged"] = advance
+        _emit(ctx, human, data)
 
 
 @app.command()

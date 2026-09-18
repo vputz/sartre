@@ -1,27 +1,35 @@
 ## 1. Factor the publish tail
 
-- [ ] 1.1 `src/sartre/repository.py`: extract the post-entry-building body of `publish` — acquire lease → heartbeat → upload the given sources (`known_hash` dedup) → self-check → `commit` → self-check → `set_pointer` CAS → release — into a private helper taking `(coord, entries, uploads: Mapping[str, bytes | Path], *, pointer, expected, metadata, actor, reason)`. `publish` calls it with every path as an upload; behavior unchanged (existing publish tests stay green).
+- [x] 1.1 `_write_version(coord, entries, uploads, *, pointer, metadata, actor, reason)` extracted from `publish`; `publish` calls it with every path as an upload (behavior unchanged, existing tests green).
 
-## 2. publish_over
+## 2. publish_over core (base + changes + remove)
 
-- [ ] 2.1 `Repository.publish_over(coord, base: Ref = HEAD, *, set={}, remove=(), pointer="head", metadata=None, actor="unknown", reason=None) -> Version`: resolve `base` → snapshot; seed `{path: Entry}` from its entries; drop `remove` paths (raise a typed error — `PathError`/`NotFound` — if a removed path is absent); for each `set` source, `normalize_path`, hash it (pass 1) into a fresh `Entry`, override/add; run `check_no_case_collisions` on the merged set; compute `version`/`hashes` over all merged entries; determine the pointer's current value for the CAS; call the §1 helper with `uploads = the set sources only`.
-- [ ] 2.2 `AsyncRepository.publish_over`: awaitable wrapper offloading to the sync method.
+- [x] 2.1 `Repository.publish_over(coord, base=HEAD, *, changes={}, remove=(), …)` — resolve base, seed entries, apply remove (raise if absent) + changes (hash sources), case-collision check, call `_write_version`. (Revised below: now returns `PublishOverResult`, uses base-version `expected` for same-lineage advances.)
 
-## 3. CLI
+## 3. TLA: derive vs concurrent advance (do first)
 
-- [ ] 3.1 `src/sartre/cli/ops.py`: `publish_over(repo, coord, base_ref, changes: Mapping[str, Path], *, remove, pointer, also_alias, metadata, actor, reason)` (Typer-free) → `repo.publish_over(...)`; reuse `gather_sources` for the `changes` map.
-- [ ] 3.2 `src/sartre/cli/app.py`: `publish-over` command — args `<coord> [sources…]`, options `--from <ref>` (base, default head), `--rm <path>` (repeatable), and the publish set (`-p/--pointer`, `--point`, `--as/--author`, `-m/--message`, `--meta`). Parse `--from` via the ref grammar; emit the new version id (human / `--json`).
+- [x] 3.1 `openspec/changes/publish-over/model/PublishOver.tla`: model a `publish_over` (reads base at one instant, advances a pointer at a later instant) racing a plain `publish` that moves the pointer in between. Invariant: **a pointer is never advanced to a version whose base ≠ the pointer's value at the advance** (no silent lost update). Toggle the CAS `expected` between fresh-head (should break) and base-version (should hold); include the `--stage`→verify→promote path (staged pointer new; separate promote of the staged version) to see whether the promote needs its own base-check.
+- [x] 3.2 Run through the `tla-verifier` agent (SANY → smoke → exhaustive → coverage). Capture the verdict; record in `design.md` the confirmed `expected` rule and the resolution for the stage→promote path (base-checked promote / document re-derive / defer to the sibling change).
 
-## 4. Tests
+## 4. Advance semantics fix
 
-- [ ] 4.1 Change-one-file: derive with `set={"cfg.json": …}` over a multi-file base → new version has the new cfg + unchanged rest; a counting backend shows only the changed blob staged (unchanged neither uploaded nor re-hashed).
-- [ ] 4.2 Property (Hypothesis): no-op derive (`set={}`, `remove=()`) yields the base's version id; overriding a path with byte-identical content yields the base's version id and uploads nothing.
-- [ ] 4.3 `remove` drops a path; removing an absent path raises the typed error.
-- [ ] 4.4 Reused blobs resolvable: derived version resolves and unchanged files' bytes come from the pre-existing blobs (e.g. via a cold cache / direct remote).
-- [ ] 4.5 Provenance + pointer: derived version's tip event carries actor/reason; head (or `--point` alias) advances via CAS.
-- [ ] 4.6 CLI e2e: `publish-over` against head changing one file (+ `--rm`, `--from @version`); `--json` output; author required.
+- [x] 4.1 `_write_version` takes an explicit `expected: Version | None` (no longer reads head internally). `publish` passes head-at-write (unchanged behavior). `publish_over` computes `expected` per the §3-verified rule: base version for a same-lineage advance; `None` for a fresh `--stage` pointer; the advanced pointer's current value for a cross-lineage `--point`; current head only under `--force`. A moved pointer → `Conflict` (retryable).
+- [x] 4.2 Apply whatever the model requires for the `--stage`→promote path (per 3.2).
 
-## 5. Gates
+## 5. Refinements
 
-- [ ] 5.1 `ruff` clean, `pyright` clean, full default suite green.
-- [ ] 5.2 `openspec validate publish-over --strict` passes.
+- [x] 5.1 `rename` param on `publish_over` — apply after `remove`, before `changes`: move the base entry (content_hash/size/inline) `old`→`new`, drop `old`, no source/upload; raise `PathError` if `old` absent.
+- [x] 5.2 `PublishOverResult` frozen dataclass `(version, inherited, replaced, added, removed, renamed)`; compute counts against the base; return it. Export from `sartre`. Adjust existing publish_over tests to `.version`.
+- [x] 5.3 CLI `ops.publish_over` + `app.py`: `--from`, `--rm`, `--mv <old:new>`, `--stage`, publish's shared flags; the head-divergence guard; `--force` requires `-m` and prints the discard summary; print `inherited/replaced/added/removed/renamed` (human + `--json`).
+
+## 6. Tests
+
+- [x] 6.1 Identity properties (no-op derive == base; identical override == base + no upload) — done; adjust to `.version`.
+- [x] 6.2 Rename: reuses blob, zero uploads, absent raises. Result counts: replaced/inherited/added/removed/renamed correct.
+- [x] 6.3 **Concurrency**: a `publish_over` whose base is stale (pointer advanced since base was read) raises `Conflict` and does not clobber the newer version — the code-level counterpart of the §3 invariant.
+- [x] 6.4 CLI: `--mv`; `--stage` lands on the printed staging pointer, head unchanged, staged version resolves via that ref; reporting + `--json` counts; divergent `--from` refuses; `--force` without `-m` refuses; `--force -m …` prints discards and succeeds.
+
+## 7. Gates
+
+- [x] 7.1 `ruff` clean, `pyright` clean, full default suite green.
+- [x] 7.2 `openspec validate publish-over --strict` passes.

@@ -13,7 +13,7 @@ from typing import Any
 
 from sartre.cli.errors import CliError
 from sartre.model import Alias, Coordinate, Head, Pin, Ref, Version
-from sartre.repository import Repository, RetentionPolicy
+from sartre.repository import PublishOverResult, Repository, RetentionPolicy
 
 # --- source gathering for publish (filesystem logic, testable without Typer) ---
 
@@ -171,6 +171,32 @@ def publish(
     if also_alias is not None and also_alias != pointer:
         move_pointer(repo, coord, also_alias, Pin(version), force=False, actor=actor, reason=reason)
     return version
+
+
+def publish_over(
+    repo: Repository,
+    coord: Coordinate,
+    base: Ref,
+    changes: Mapping[str, Path],
+    *,
+    remove: Sequence[str] = (),
+    rename: Mapping[str, str] | None = None,
+    pointer: str = "head",
+    also_alias: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    actor: str = "unknown",
+    reason: str | None = None,
+) -> PublishOverResult:
+    """Derive a new version from ``base`` (changes/remove/rename); returns the result + counts."""
+    result = repo.publish_over(
+        coord, base, changes=dict(changes), remove=list(remove), rename=dict(rename or {}),
+        pointer=pointer, metadata=dict(metadata or {}), actor=actor, reason=reason,
+    )
+    if also_alias is not None and also_alias != pointer:
+        move_pointer(
+            repo, coord, also_alias, Pin(result.version), force=False, actor=actor, reason=reason
+        )
+    return result
 
 
 def move_pointer(
