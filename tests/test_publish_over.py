@@ -300,3 +300,69 @@ def test_cli_force_requires_message(tmp_path: Path) -> None:
     )
     assert r.exit_code != 0
     assert "requires -m" in r.output
+
+
+# --- staging as a first-class library operation ---
+
+
+def test_stage_lands_off_head_and_records_base() -> None:
+    repo, _ = _counting_repo()
+    base = repo.publish(COORD, {"a.txt": b"A"})
+    r = repo.publish_over(COORD, changes={"a.txt": b"B"}, stage=True)
+    assert r.staged_pointer is not None and r.staged_pointer.startswith("staging-")
+    assert repo.head(COORD) == base  # head untouched
+    from sartre.model import Alias
+
+    assert repo.head(COORD, Alias(r.staged_pointer)) == r.version  # staged on that pointer
+    snap = repo.resolve(COORD, Alias(r.staged_pointer))
+    assert snap.metadata["derived_from"] == base  # recorded for a base-CAS promote
+    got = repo.promote(COORD, Alias(r.staged_pointer))
+    assert got == r.version and repo.head(COORD) == r.version
+
+
+def test_staged_pointer_name_is_idempotent_for_the_same_repair() -> None:
+    repo, _ = _counting_repo()
+    repo.publish(COORD, {"a.txt": b"A", "b.txt": b"B"})
+    p1 = repo.publish_over(COORD, changes={"a.txt": b"B1"}, stage=True).staged_pointer
+    # a re-run of the same repair (same base + same affected path) reuses the pointer
+    p2 = repo.publish_over(COORD, changes={"a.txt": b"B2"}, stage=True).staged_pointer
+    assert p1 == p2  # same staging pointer, not a fresh orphan
+    # a different affected path yields a different staging pointer
+    p3 = repo.publish_over(COORD, changes={"b.txt": b"B3"}, stage=True).staged_pointer
+    assert p3 != p1
+    assert {n for n in repo.list_pointers(COORD) if n.startswith("staging-")} == {p1, p3}
+
+
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(
+    files=st.dictionaries(st.text("abc", min_size=1, max_size=4), st.binary(max_size=8),
+                          min_size=1, max_size=4),
+    changed=st.lists(st.text("abc", min_size=1, max_size=4), min_size=1, max_size=3),
+)
+def test_property_staging_name_is_pure(make_repo, files, changed) -> None:  # noqa: ANN001
+    from sartre.repository import _staging_pointer_name
+
+    repo = make_repo()
+    base = repo.publish(COORD, files)
+    affected = {c for c in changed}
+    # the helper is a pure function of (base version, affected paths)
+    assert _staging_pointer_name(base, affected) == _staging_pointer_name(base, sorted(affected))
+    assert _staging_pointer_name(base, affected).startswith("staging-")
+
+
+def test_cli_stage_rerun_reuses_pointer(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    f = tmp_path / "a.txt"
+    f.write_bytes(b"A")
+    _run(repo, "publish", "m/prod", str(f), "--as", "a")
+    f2 = tmp_path / "a2.txt"
+    f2.write_bytes(b"B")
+    p1 = json.loads(
+        _run(repo, "--json", "publish-over", "m/prod", f"a.txt={f2}", "--stage", "--as", "b").stdout
+    )["staged"]
+    f3 = tmp_path / "a3.txt"
+    f3.write_bytes(b"C")  # re-run the same repair (same base + path) after a "failed verify"
+    p2 = json.loads(
+        _run(repo, "--json", "publish-over", "m/prod", f"a.txt={f3}", "--stage", "--as", "b").stdout
+    )["staged"]
+    assert p1 == p2  # reused, not orphaned

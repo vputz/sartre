@@ -10,6 +10,7 @@ to a thread.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import tempfile
 import threading
@@ -30,6 +31,18 @@ from sartre.ports import DEFAULT_LEASE_TTL, LogEntry, PointerMove, Registry, Sto
 
 def _pointer_ref(pointer: str) -> Ref:
     return Head() if pointer == "head" else Alias(pointer)
+
+
+def _staging_pointer_name(base_version: Version, affected_paths: Iterable[str]) -> str:
+    """A content-derived staging pointer name for a ``publish_over(stage=True)`` derive.
+
+    Deterministic in ``(base_version, affected_paths)`` — the "repair intent" — so re-running
+    the same derive reuses the same staging pointer instead of littering a new one. The
+    12-hex suffix is a valid alias segment (no ``/``).
+    """
+    material = base_version + "\n" + "\n".join(sorted(affected_paths))
+    digest = hashlib.sha256(material.encode()).hexdigest()[:12]
+    return f"staging-{digest}"
 
 
 def _source_stream(src: bytes | Path) -> BinaryIO:
@@ -76,6 +89,7 @@ class PublishOverResult:
     added: int      # new paths from ``changes``
     removed: int    # paths dropped
     renamed: int    # paths re-keyed (blob reused)
+    staged_pointer: str | None = None  # the staging pointer advanced when ``stage=True``
 
 
 class Repository:
@@ -307,6 +321,7 @@ class Repository:
         remove: Iterable[str] = (),
         rename: Mapping[str, str] | None = None,
         pointer: str = "head",
+        stage: bool = False,
         metadata: Mapping[str, object] | None = None,
         actor: str = "unknown",
         reason: str | None = None,
@@ -320,6 +335,14 @@ class Repository:
         (``base`` is never mutated); an empty derive, or an override with byte-identical content,
         yields ``base``'s own version id.
 
+        With ``stage=False`` (default) the derive advances ``pointer``. With ``stage=True`` it
+        instead advances a **staging pointer it names itself** (``pointer`` is ignored),
+        records the base's version as ``derived_from`` in the new version's metadata, and
+        reports that pointer as ``PublishOverResult.staged_pointer`` — so the version can be
+        verified via that ref and later promoted to head with a base-CAS :meth:`promote`. The
+        staging name is content-derived from the base and the affected paths, so re-running the
+        same derive reuses the same pointer (idempotent repair) rather than orphaning one.
+
         The advance is compare-and-swap on the value the derive is predicated on: for a
         same-lineage advance (advancing the very pointer ``base`` names) that is ``base``'s
         version, so a concurrent move raises :class:`~sartre.errors.Conflict` rather than
@@ -330,6 +353,7 @@ class Repository:
         """
         base_snap = self.resolve(coord, base)
         merged: dict[str, Entry] = {entry.path: entry for entry in base_snap.entries}
+        affected: set[str] = set()  # the "repair intent" — for the content-derived staging name
 
         removed = 0
         for path in remove:
@@ -337,6 +361,7 @@ class Repository:
             if key not in merged:
                 raise PathError(f"cannot remove {path!r}: not present in the base version")
             del merged[key]
+            affected.add(key)
             removed += 1
 
         renamed = 0
@@ -347,6 +372,7 @@ class Repository:
             e = merged.pop(old_key)
             new_key = normalize_path(new)
             merged[new_key] = Entry(new_key, e.content_hash, e.size, e.inline)  # same blob
+            affected.update((old_key, new_key))
             renamed += 1
 
         uploads: dict[str, bytes | Path] = {}
@@ -356,10 +382,19 @@ class Repository:
             replaced, added = (replaced + 1, added) if key in merged else (replaced, added + 1)
             merged[key] = Entry(key, self._hash_source(src), _source_size(src))
             uploads[key] = src
+            affected.add(key)
 
         check_no_case_collisions(merged)
         entries = tuple(merged[key] for key in sorted(merged))
         inherited = len(entries) - replaced - added - renamed
+
+        # Staging derives onto a self-named, content-derived pointer (never head) and records
+        # the base so a later `promote` can base-CAS against it.
+        staged_pointer: str | None = None
+        if stage:
+            staged_pointer = _staging_pointer_name(base_snap.version, affected)
+            pointer = staged_pointer
+            metadata = {**(metadata or {}), "derived_from": base_snap.version}
 
         # Pin the advance to the base when advancing the very pointer the base names;
         # otherwise standard CAS on the advanced pointer's current value (None if unset).
@@ -378,7 +413,9 @@ class Repository:
             coord, entries, uploads, pointer=pointer, expected=expected,
             metadata=metadata, actor=actor, reason=reason,
         )
-        return PublishOverResult(version, inherited, replaced, added, removed, renamed)
+        return PublishOverResult(
+            version, inherited, replaced, added, removed, renamed, staged_pointer
+        )
 
     # --- garbage collection ---
 

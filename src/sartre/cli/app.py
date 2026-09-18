@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import sys
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -338,15 +337,12 @@ def publish_over(
 
         _guard_divergent_base(repo, c, base_ref, force=force, message=message)
 
-        advance = pointer
-        if stage:
-            advance = f"staging-{uuid.uuid4().hex[:12]}"
-            # record the base so a later `sartre promote` can base-CAS head against it
-            metadata = {**metadata, "derived_from": repo.head(c, base_ref)}
+        # --stage is a pass-through to the library: it names a content-derived staging
+        # pointer and records derived_from itself (see Repository.publish_over).
         result = ops.publish_over(
             repo, c, base_ref, ops.gather_sources(sources or []),
-            remove=remove, rename=rename, pointer=advance, also_alias=None if stage else also,
-            metadata=metadata, actor=who, reason=message,
+            remove=remove, rename=rename, pointer=pointer, stage=stage,
+            also_alias=None if stage else also, metadata=metadata, actor=who, reason=message,
         )
         counts = (
             f"inherited {result.inherited}, replaced {result.replaced}, added {result.added}, "
@@ -359,11 +355,12 @@ def publish_over(
             "removed": result.removed, "renamed": result.renamed,
         }
         if stage:
+            staged = result.staged_pointer
             human += (
-                f"\nstaged at {c.name}/{c.env}:{advance} (head unchanged) — verify it, then:\n"
-                f"  sartre promote {c.name}/{c.env} {advance}"
+                f"\nstaged at {c.name}/{c.env}:{staged} (head unchanged) — verify it, then:\n"
+                f"  sartre promote {c.name}/{c.env} {staged}"
             )
-            data["staged"] = advance
+            data["staged"] = staged
         _emit(ctx, human, data)
 
 

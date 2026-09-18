@@ -182,6 +182,7 @@ def publish_over(
     remove: Sequence[str] = (),
     rename: Mapping[str, str] | None = None,
     pointer: str = "head",
+    stage: bool = False,
     also_alias: str | None = None,
     metadata: Mapping[str, Any] | None = None,
     actor: str = "unknown",
@@ -190,7 +191,7 @@ def publish_over(
     """Derive a new version from ``base`` (changes/remove/rename); returns the result + counts."""
     result = repo.publish_over(
         coord, base, changes=dict(changes), remove=list(remove), rename=dict(rename or {}),
-        pointer=pointer, metadata=dict(metadata or {}), actor=actor, reason=reason,
+        pointer=pointer, stage=stage, metadata=dict(metadata or {}), actor=actor, reason=reason,
     )
     if also_alias is not None and also_alias != pointer:
         move_pointer(
