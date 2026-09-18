@@ -5,7 +5,9 @@ Define the ephemeral, single-process reference backend that makes the blob and
 manifest ports runnable end-to-end. It is the executable oracle for the port
 contracts — suitable for tests and local use — and the substrate against which
 the publish-transaction invariants are property-checked on live code.
+
 ## Requirements
+
 ### Requirement: In-memory reference backend
 The library SHALL provide an ephemeral, single-process reference backend — a
 memory-backed `Store` and an in-memory `Registry` — that implements the blob and
@@ -67,3 +69,9 @@ The in-memory reference backend SHALL record commit `actor`/`reason` on its per-
 - **WHEN** a version is committed and a pointer moved with an actor and reason against the in-memory backend
 - **THEN** `list_log` exposes the commit's actor/reason and `list_pointer_history` exposes the move's from/to versions, actor, reason, and time — matching the persistent backend for the same sequence
 
+### Requirement: In-memory backend supports pointer deletion
+The in-memory reference backend SHALL implement `delete_pointer` under its lock: with the lock held it SHALL compare the pointer's current value to `expected`, raise `Conflict` on a mismatch, otherwise remove the pointer and append the corresponding deletion to its pointer-move history. Deleting an absent pointer with `expected=None` SHALL be a no-op. This preserves the backend's role as the executable oracle the persistent and S3 backends are checked against.
+
+#### Scenario: Delete under the lock is compare-and-swap
+- **WHEN** `delete_pointer(coord, name, expected=v)` is called on the in-memory backend and the pointer currently holds `v`
+- **THEN** the pointer is removed atomically and a deletion move (`to_version=None`) is recorded; if it held a different value, `Conflict` is raised and nothing changes

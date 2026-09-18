@@ -1,6 +1,6 @@
 [project]
 name = "sartre"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sartre: Simple ARTifact REpository — a content-addressed versioned binary artifact repository (manifest plane + blob plane)."
 readme = "README.md"
 license = "Apache-2.0"
