@@ -35,6 +35,35 @@ class SqliteRegistry(_SqlRegistry):
     def _connect(self) -> _Conn:
         return sqlite3.connect(self._db_path, check_same_thread=False, isolation_level=None)
 
+    def _migrate(self, conn: _Conn) -> None:
+        """Relax `pointer_moves.to_version` to nullable in a pre-existing database.
+
+        SQLite has no ``ALTER COLUMN … DROP NOT NULL``, so rebuild the table (create-new →
+        copy → swap) only when the column is still ``NOT NULL``. Rows are preserved; the
+        rebuild is wrapped in a transaction so a crash cannot leave a half-migrated schema.
+        """
+        info = conn.execute("PRAGMA table_info(pointer_moves)").fetchall()
+        # PRAGMA columns: (cid, name, type, notnull, dflt_value, pk)
+        if not any(c[1] == "to_version" and c[3] == 1 for c in info):
+            return  # already nullable (fresh DB or already migrated)
+        create = next(s for s in self._schema() if "CREATE TABLE IF NOT EXISTS pointer_moves" in s)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DROP TABLE IF EXISTS pointer_moves_old")
+            conn.execute("ALTER TABLE pointer_moves RENAME TO pointer_moves_old")
+            conn.execute(create)  # recreates with nullable to_version
+            conn.execute(
+                "INSERT INTO pointer_moves(move_seq, coord_name, coord_env, pointer, "
+                "from_version, to_version, actor, reason, at) "
+                "SELECT move_seq, coord_name, coord_env, pointer, from_version, to_version, "
+                "actor, reason, at FROM pointer_moves_old"
+            )
+            conn.execute("DROP TABLE pointer_moves_old")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
     @contextmanager
     def _tx(self) -> Iterator[_Conn]:
         with self._lock:

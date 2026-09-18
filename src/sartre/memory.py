@@ -175,6 +175,38 @@ class MemoryRegistry:
             )
             state.next_seq += 1
 
+    def delete_pointer(
+        self,
+        coord: Coordinate,
+        name: str,
+        *,
+        expected: Version | None,
+        actor: str = "unknown",
+        reason: str | None = None,
+    ) -> None:
+        with self._lock:
+            existing = self._peek(coord)  # don't materialize the coord on a conflict/no-op
+            current = existing.pointers.get(name) if existing else None
+            if current != expected:
+                raise Conflict(
+                    f"pointer {name!r} for {coord} is {current}, expected {expected}"
+                )
+            if current is None:
+                return  # nothing to delete → idempotent no-op, records nothing
+            state = self._state(coord)
+            now = datetime.now(UTC)
+            del state.pointers[name]
+            state.moves.append(  # a deletion is a move to nothing (to_version=None)
+                PointerMove(
+                    name=name,
+                    from_version=current,
+                    to_version=None,
+                    actor=actor,
+                    reason=reason,
+                    at=now,
+                )
+            )
+
     # --- enumeration & lifecycle (garbage collection) ---
 
     def list_coordinates(self) -> Sequence[Coordinate]:

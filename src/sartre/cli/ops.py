@@ -234,6 +234,43 @@ def move_pointer(
     raise CliError(f"pointer {name!r} kept moving under --force; giving up")
 
 
+def delete_pointer(
+    repo: Repository,
+    coord: Coordinate,
+    name: str,
+    *,
+    actor: str = "unknown",
+    reason: str | None = None,
+) -> None:
+    """Remove a mutable alias (CAS-safe; refuses ``head`` at the facade)."""
+    repo.delete_pointer(coord, name, actor=actor, reason=reason)
+
+
+def promote(
+    repo: Repository,
+    coord: Coordinate,
+    staged: Ref,
+    *,
+    pointer: str = "head",
+    force: bool = False,
+    delete_staging: bool = True,
+    actor: str = "unknown",
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Base-CAS promote of a staged version, then clean up the spent staging alias.
+
+    Returns the promoted version, the pointer advanced, and the staging alias deleted (if any).
+    """
+    version = repo.promote(
+        coord, staged, pointer=pointer, force=force, actor=actor, reason=reason
+    )
+    deleted: str | None = None
+    if delete_staging and isinstance(staged, Alias) and staged.name != pointer:
+        repo.delete_pointer(coord, staged.name, actor=actor, reason=reason)  # spent → remove
+        deleted = staged.name
+    return {"version": version, "promoted_to": pointer, "deleted_staging": deleted}
+
+
 def gc(
     repo: Repository,
     *,

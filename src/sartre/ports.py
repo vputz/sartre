@@ -49,13 +49,14 @@ class LogEntry:
 class PointerMove:
     """One append-only pointer-move record: who moved a pointer, from what, to what, and why.
 
-    ``from_version`` is ``None`` when the pointer was created (had no prior value). A move is
-    recorded only for a *successful* compare-and-swap; a rejected CAS records nothing.
+    ``from_version`` is ``None`` when the pointer was created (had no prior value).
+    ``to_version`` is ``None`` when the move is a *deletion* (the pointer was removed). A move
+    is recorded only for a *successful* compare-and-swap; a rejected CAS records nothing.
     """
 
     name: str
     from_version: Version | None
-    to_version: Version
+    to_version: Version | None
     actor: str
     reason: str | None
     at: datetime
@@ -129,6 +130,27 @@ class Registry(Protocol):
         to the coordinate's pointer-move history capturing ``(name, expected, version,
         actor, reason, now)``. A rejected CAS writes neither. ``actor`` defaults to
         ``"unknown"`` when omitted — this is the sole write point for change provenance.
+        """
+        ...
+
+    def delete_pointer(
+        self,
+        coord: Coordinate,
+        name: str,
+        *,
+        expected: Version | None,
+        actor: str = "unknown",
+        reason: str | None = None,
+    ) -> None:
+        """Atomically remove a mutable pointer via compare-and-swap.
+
+        Contract: the pointer is removed only if its current value equals ``expected``. On
+        mismatch, raise :class:`~sartre.errors.Conflict` and leave the pointer unchanged.
+        Deleting a pointer that does not currently exist with ``expected=None`` is a no-op
+        (idempotent cleanup), appending nothing. On a real removal, append exactly one
+        :class:`PointerMove` recording ``(name, prior_value, None, actor, reason, now)`` — a
+        deletion carries ``to_version=None``. This removes only the mutable label; no manifest
+        or blob is dropped. ``actor`` defaults to ``"unknown"`` when omitted.
         """
         ...
 

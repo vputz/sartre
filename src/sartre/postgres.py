@@ -43,6 +43,14 @@ class PostgresRegistry(_SqlRegistry):
         assert psycopg is not None  # guaranteed by __init__
         return psycopg.connect(self._dsn, autocommit=True)
 
+    def _migrate(self, conn: _Conn) -> None:
+        """Relax `pointer_moves.to_version` to nullable so deletions (NULL target) record.
+
+        ``DROP NOT NULL`` on an already-nullable column is a no-op in Postgres, so this is
+        idempotent and safe on both fresh and pre-existing databases.
+        """
+        conn.execute("ALTER TABLE pointer_moves ALTER COLUMN to_version DROP NOT NULL")
+
     @contextmanager
     def _tx(self) -> Iterator[_Conn]:
         with self._lock, self._conn.transaction():  # type: ignore[attr-defined]

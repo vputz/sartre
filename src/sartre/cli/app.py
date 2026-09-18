@@ -20,7 +20,7 @@ import typer
 from sartre.cli import config, ops, refs
 from sartre.cli.duration import parse_duration
 from sartre.cli.errors import CliError
-from sartre.errors import Conflict, IntegrityError, NotFound, PathError
+from sartre.errors import Conflict, NotFound, SartreError
 from sartre.model import Head, Ref
 
 app = typer.Typer(
@@ -51,7 +51,7 @@ def _global(
 def _handle() -> Iterator[None]:
     try:
         yield
-    except (CliError, NotFound, Conflict, IntegrityError, PathError) as exc:
+    except (CliError, SartreError) as exc:  # SartreError covers NotFound/Conflict/PathError/…
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(1) from exc
 
@@ -338,7 +338,11 @@ def publish_over(
 
         _guard_divergent_base(repo, c, base_ref, force=force, message=message)
 
-        advance = f"staging-{uuid.uuid4().hex[:12]}" if stage else pointer
+        advance = pointer
+        if stage:
+            advance = f"staging-{uuid.uuid4().hex[:12]}"
+            # record the base so a later `sartre promote` can base-CAS head against it
+            metadata = {**metadata, "derived_from": repo.head(c, base_ref)}
         result = ops.publish_over(
             repo, c, base_ref, ops.gather_sources(sources or []),
             remove=remove, rename=rename, pointer=advance, also_alias=None if stage else also,
@@ -357,7 +361,7 @@ def publish_over(
         if stage:
             human += (
                 f"\nstaged at {c.name}/{c.env}:{advance} (head unchanged) — verify it, then:\n"
-                f"  sartre point {c.name}/{c.env} @{result.version}"
+                f"  sartre promote {c.name}/{c.env} {advance}"
             )
             data["staged"] = advance
         _emit(ctx, human, data)
@@ -390,6 +394,64 @@ def point(
             ) from exc
         moved = f"{refs.render_coord(coord)}:{name} -> {version}"
         _emit(ctx, moved, {"pointer": name, "version": version})
+
+
+@app.command(name="delete-pointer")
+def delete_pointer(
+    ctx: typer.Context,
+    target_ref: str = typer.Argument(..., help="name/env:alias (the pointer to remove)."),
+    author: str | None = typer.Option(None, "--author", "--as", help="Who is deleting it."),
+    message: str | None = typer.Option(None, "-m", "--message", help="Why (the delete reason)."),
+) -> None:
+    """Delete a mutable alias (e.g. a spent staging pointer). Refuses 'head'."""
+    with _handle():
+        target = _target(ctx)
+        who = _author(target, author)
+        coord, r = refs.parse_ref(target_ref, default_env=target.default_env)
+        name = refs.pointer_name(r)  # 'head' for a bare coord → facade refuses it
+        ops.delete_pointer(config.open_target(target), coord, name, actor=who, reason=message)
+        _emit(
+            ctx,
+            f"{refs.render_coord(coord)}:{name} deleted",
+            {"pointer": name, "deleted": True},
+        )
+
+
+@app.command()
+def promote(
+    ctx: typer.Context,
+    target_ref: str = typer.Argument(..., help="name/env[:pointer] to advance (default head)."),
+    source: str = typer.Argument(..., help="A staging alias name, 'head', or a version id."),
+    author: str | None = typer.Option(None, "--author", "--as", help="Who is promoting."),
+    message: str | None = typer.Option(None, "-m", "--message", help="Why (the promote reason)."),
+    force: bool = typer.Option(
+        False, "--force", help="Last-writer promote when the version records no base."
+    ),
+    keep_staging: bool = typer.Option(
+        False, "--keep-staging", help="Do not delete the source staging alias after promoting."
+    ),
+) -> None:
+    """Base-CAS promote a staged version to a pointer (refuses if the pointer moved)."""
+    with _handle():
+        target = _target(ctx)
+        who = _author(target, author)
+        coord, r = refs.parse_ref(target_ref, default_env=target.default_env)
+        pointer = refs.pointer_name(r)
+        src = refs.parse_source(coord, source)
+        try:
+            result = ops.promote(
+                config.open_target(target), coord, src, pointer=pointer, force=force,
+                delete_staging=not keep_staging, actor=who, reason=message,
+            )
+        except Conflict as exc:
+            raise CliError(
+                f"{pointer!r} moved since the version was staged — re-derive, or "
+                "verify and use 'sartre point' deliberately"
+            ) from exc
+        human = f"{refs.render_coord(coord)}:{pointer} -> {result['version']}"
+        if result["deleted_staging"]:
+            human += f"\ndeleted staging pointer {result['deleted_staging']}"
+        _emit(ctx, human, result)
 
 
 @app.command()

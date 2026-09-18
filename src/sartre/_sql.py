@@ -50,6 +50,15 @@ class _SqlRegistry:
         with self._lock:
             for statement in self._schema():
                 self._exec(self._conn, statement)
+            self._migrate(self._conn)
+
+    def _migrate(self, conn: _Conn) -> None:
+        """Bring an existing database up to the current schema. Default: nothing.
+
+        Dialect subclasses override to relax `pointer_moves.to_version` to nullable so a
+        pointer deletion (to_version NULL) can be recorded in a registry created before that
+        column allowed nulls. Idempotent.
+        """
 
     # --- dialect seam (subclasses override) ---
 
@@ -81,7 +90,7 @@ class _SqlRegistry:
             "actor TEXT NOT NULL DEFAULT 'unknown', reason TEXT)",
             f"CREATE TABLE IF NOT EXISTS pointer_moves (move_seq {self._SEQ_TYPE}, "
             "coord_name TEXT NOT NULL, coord_env TEXT NOT NULL, pointer TEXT NOT NULL, "
-            "from_version TEXT, to_version TEXT NOT NULL, "
+            "from_version TEXT, to_version TEXT, "  # to_version NULL == a pointer deletion
             "actor TEXT NOT NULL, reason TEXT, at TEXT NOT NULL)",
             f"CREATE TABLE IF NOT EXISTS leases (lease_id {self._SEQ_TYPE}, "
             f"version TEXT NOT NULL, hashes TEXT NOT NULL, expires_at {self._TS_TYPE} NOT NULL)",
@@ -292,6 +301,45 @@ class _SqlRegistry:
                 "INSERT INTO pointer_moves(coord_name, coord_env, pointer, from_version, "
                 "to_version, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (coord.name, coord.env, name, expected, version, actor, reason, now),
+            )
+
+    def delete_pointer(
+        self,
+        coord: Coordinate,
+        name: str,
+        *,
+        expected: Version | None,
+        actor: str = "unknown",
+        reason: str | None = None,
+    ) -> None:
+        with self._tx() as conn:
+            row = self._exec(
+                conn,
+                "SELECT version FROM pointers WHERE coord_name=? AND coord_env=? AND name=?",
+                (coord.name, coord.env, name),
+            ).fetchone()
+            current = row[0] if row is not None else None
+            if current != expected:
+                raise Conflict(
+                    f"pointer {name!r} for {coord} is {current}, expected {expected}"
+                )
+            if current is None:
+                return  # nothing to delete → idempotent no-op, records nothing
+            cur = self._exec(  # guarded delete = CAS even if it moved after the read
+                conn,
+                "DELETE FROM pointers WHERE coord_name=? AND coord_env=? AND name=? AND version=?",
+                (coord.name, coord.env, name, expected),
+            )
+            if cur.rowcount != 1:
+                raise Conflict(
+                    f"pointer {name!r} for {coord} moved during delete, expected {expected}"
+                )
+            now = datetime.now(UTC).isoformat()
+            self._exec(  # a deletion is a move to nothing (to_version NULL)
+                conn,
+                "INSERT INTO pointer_moves(coord_name, coord_env, pointer, from_version, "
+                "to_version, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (coord.name, coord.env, name, current, None, actor, reason, now),
             )
 
     def drop_version(self, version: Version) -> None:

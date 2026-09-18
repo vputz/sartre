@@ -132,13 +132,15 @@ class S3Registry:
     def _pointer_scan(
         self, coord: Coordinate, name: str, *, refresh: bool = False
     ) -> tuple[int, Version | None]:
-        """(raw tail seq, effective version) for a pointer, skipping tombstoned targets.
+        """(raw tail seq, effective version) for a pointer; ``None`` when unset or deleted.
 
-        The raw seq drives the gap-free CAS; the effective version is the newest event
-        whose version is not tombstoned — so a pointer whose tail target was GC-dropped
-        reverts to the last valid version rather than resolving to nothing. This upholds
-        the S3Drop invariant (a reader never resolves to a reclaimed manifest), verified
-        in ``model/S3Drop.tla``.
+        The raw seq drives the gap-free CAS. Scanning newest-first: a **pointer-tombstone**
+        event (a deletion sentinel, ``version`` null) makes the pointer unset — a deletion is
+        a floor, never reverting to an older value (verified in ``model/PointerDrop.tla``); a
+        later advance appended above it re-creates the pointer. Otherwise the effective value
+        is the newest event whose version is not manifest-tombstoned, so a tail target that GC
+        dropped reverts to the last valid version rather than to nothing (the S3Drop invariant,
+        ``model/S3Drop.tla``).
         """
         prefix = self._pointer_prefix(coord, name)
         keys = sorted(
@@ -148,7 +150,11 @@ class S3Registry:
         raw_seq = int(keys[0][: -len(".json")]) if keys else 0
         for key in keys:
             event = self._get_json(f"{prefix}/{key}")
-            if event is not None and not self._is_tombstoned(event["version"]):
+            if event is None:
+                continue
+            if event.get("version") is None:  # pointer-tombstone: deleted, don't revert past it
+                return raw_seq, None
+            if not self._is_tombstoned(event["version"]):
                 return raw_seq, event["version"]
         return raw_seq, None
 
@@ -194,8 +200,9 @@ class S3Registry:
         tombstoned = self._tombstoned_versions()  # one listing, not an fs.exists per event
         seen: dict[Version, None] = {}
         for _name, _seq, event in self._all_events(coord):
-            if event["version"] not in tombstoned:
-                seen.setdefault(event["version"], None)
+            v = event["version"]
+            if v is not None and v not in tombstoned:  # skip pointer-tombstones (null version)
+                seen.setdefault(v, None)
         return list(seen)
 
     def list_coordinates(self) -> Sequence[Coordinate]:
@@ -207,6 +214,8 @@ class S3Registry:
 
     def list_log(self, coord: Coordinate) -> Sequence[LogEntry]:
         # History is forever: tip events for dropped versions are retained (not filtered).
+        # Pointer-tombstone events (null version) are deletions, not commits → excluded here
+        # (they surface in list_pointer_history with to_version=None).
         return [
             LogEntry(
                 version=event["version"],
@@ -215,7 +224,9 @@ class S3Registry:
                 actor=event.get("actor", "unknown"),
                 reason=event.get("reason"),
             )
-            for i, (_name, _seq, event) in enumerate(self._all_events(coord))
+            for i, (_name, _seq, event) in enumerate(
+                e for e in self._all_events(coord) if e[2].get("version") is not None
+            )
         ]
 
     def list_pointer_history(self, coord: Coordinate) -> Sequence[PointerMove]:
@@ -270,6 +281,42 @@ class S3Registry:
                 {
                     "seq": seq + 1,
                     "version": version,
+                    "from": current,
+                    "actor": actor,
+                    "reason": reason,
+                    "at": datetime.now(UTC).isoformat(),
+                }
+            ).encode()
+            if self._put_if_absent(self._event_path(coord, name, seq + 1), event):
+                return
+            # FileExistsError: someone else took seq+1 → re-read tail and retry
+
+    def delete_pointer(
+        self,
+        coord: Coordinate,
+        name: str,
+        *,
+        expected: Version | None,
+        actor: str = "unknown",
+        reason: str | None = None,
+    ) -> None:
+        """Delete a pointer by appending a tombstone sentinel event through the same CAS.
+
+        A pointer has no row to remove; the deletion is an immutable event (``version`` null)
+        landed at ``seq+1`` with put-if-absent, so it races a concurrent advance coherently —
+        exactly one wins the slot (verified in ``model/PointerDrop.tla``). Deleting an already-
+        unset pointer with ``expected=None`` appends nothing (idempotent cleanup).
+        """
+        while True:  # CAS loop: put-if-absent on the next sequence number
+            seq, current = self._pointer_scan(coord, name, refresh=True)  # authoritative
+            if current != expected:
+                raise Conflict(f"pointer {name!r} for {coord} is {current}, expected {expected}")
+            if current is None:
+                return  # nothing to delete → idempotent no-op, appends nothing
+            event = json.dumps(
+                {
+                    "seq": seq + 1,
+                    "version": None,  # null target ⇒ this is a pointer-tombstone (deletion)
                     "from": current,
                     "actor": actor,
                     "reason": reason,

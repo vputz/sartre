@@ -206,6 +206,69 @@ def test_concurrent_cas_yields_exactly_one_winner(registry: S3Registry) -> None:
     assert keys == [f"{1:012d}.json", f"{2:012d}.json"]
 
 
+def test_delete_pointer_tombstones_and_recreates(registry: S3Registry) -> None:
+    """Deletion is an append-only tombstone event: hides the pointer, keeps history, recreates."""
+    v1 = registry.commit(COORD, _entries("a"), {})
+    v2 = registry.commit(COORD, _entries("b"), {})
+    registry.set_pointer(COORD, "stable", v1, expected=None, actor="a")
+    registry.delete_pointer(COORD, "stable", expected=v1, actor="a", reason="cleanup")
+
+    with pytest.raises(NotFound):
+        registry.head(COORD, Alias("stable"))
+    assert "stable" not in registry.list_pointers(COORD)
+    # history retains the deletion (to_version=None); the tombstone is not a commit-log entry
+    moves = [(m.name, m.from_version, m.to_version) for m in registry.list_pointer_history(COORD)]
+    assert ("stable", v1, None) in moves
+    assert {e.version for e in registry.list_log(COORD)} == {v1}
+
+    registry.set_pointer(COORD, "stable", v2, expected=None, actor="a")  # re-create after tombstone
+    assert registry.head(COORD, Alias("stable")) == v2
+
+
+def test_delete_racing_advance_yields_one_coherent_outcome(registry: S3Registry) -> None:
+    """A delete and an advance both targeting seq+1: one wins, the pointer stays coherent."""
+    import threading
+
+    v1 = registry.commit(COORD, _entries("a"), {})
+    v2 = registry.commit(COORD, _entries("b"), {})
+    registry.set_pointer(COORD, "stable", v1, expected=None)
+
+    results: list[tuple[str, str]] = []
+    lock = threading.Lock()
+
+    def do_delete() -> None:
+        try:
+            registry.delete_pointer(COORD, "stable", expected=v1)
+            outcome = "won"
+        except Conflict:
+            outcome = "conflict"
+        with lock:
+            results.append(("delete", outcome))
+
+    def do_advance() -> None:
+        try:
+            registry.set_pointer(COORD, "stable", v2, expected=v1)
+            outcome = "won"
+        except Conflict:
+            outcome = "conflict"
+        with lock:
+            results.append(("advance", outcome))
+
+    threads = [threading.Thread(target=do_delete), threading.Thread(target=do_advance)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    winners = [op for op, outcome in results if outcome == "won"]
+    assert len(winners) == 1  # exactly one landed at the contested slot
+    if winners[0] == "delete":
+        with pytest.raises(NotFound):
+            registry.head(COORD, Alias("stable"))
+    else:
+        assert registry.head(COORD, Alias("stable")) == v2
+
+
 def test_reads_revert_to_last_valid_when_tail_target_reclaimed(registry: S3Registry) -> None:
     """The S3Drop closure: a tombstoned tail target reverts reads to the prior valid version."""
     v1 = registry.commit(COORD, _entries("a"), {})

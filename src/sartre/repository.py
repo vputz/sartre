@@ -18,9 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
-from sartre.errors import Conflict, LeaseExpired, NotFound, PathError
+from sartre.errors import Conflict, LeaseExpired, NotFound, PathError, SartreError
 from sartre.fs import SnapshotFS
 from sartre.hashing import DEFAULT_HASHER, Hasher, manifest_version
 from sartre.model import HEAD, Alias, Coordinate, Entry, Hash, Head, Pin, Ref, Snapshot, Version
@@ -495,6 +495,73 @@ class Repository:
             coord, name, version, expected=expected, actor=actor, reason=reason
         )
 
+    def delete_pointer(
+        self,
+        coord: Coordinate,
+        name: str,
+        *,
+        actor: str = "unknown",
+        reason: str | None = None,
+    ) -> None:
+        """Remove a mutable alias via the registry's compare-and-swap deletion.
+
+        Reads the pointer's current value and deletes only if unchanged, surfacing
+        :class:`~sartre.errors.Conflict` on a concurrent move; deleting an absent alias is a
+        no-op. Refuses ``head`` — a coordinate's identity, not a removable label — before
+        touching the registry. Removes only the label; manifests/blobs persist until GC.
+        ``actor``/``reason`` attribute the deletion in the pointer-move history.
+        """
+        if name == "head":
+            raise SartreError("cannot delete 'head': it is the coordinate's identity, not a label")
+        try:
+            current: Version | None = self.registry.head(coord, _pointer_ref(name))
+        except NotFound:
+            current = None  # absent → CAS on None makes the delete an idempotent no-op
+        self.registry.delete_pointer(
+            coord, name, expected=current, actor=actor, reason=reason
+        )
+
+    def promote(
+        self,
+        coord: Coordinate,
+        staged: Ref,
+        *,
+        pointer: str = "head",
+        force: bool = False,
+        actor: str = "unknown",
+        reason: str | None = None,
+    ) -> Version:
+        """Advance ``pointer`` to the version ``staged`` resolves to, base-CAS-safe.
+
+        Compare-and-swaps ``pointer`` against the staged version's recorded base
+        (``derived_from`` metadata, written by ``publish-over --stage``), not the pointer's
+        current value — so a publish that advanced the pointer since staging raises
+        :class:`~sartre.errors.Conflict` rather than silently overwriting it (the lost update
+        ``model/PublishOver.tla`` closes for the direct advance). A staged version with no
+        recorded base (a hand-made alias, or one staged before this existed) is refused unless
+        ``force``, which falls back to a plain last-writer move against the current value.
+        Returns the promoted version.
+        """
+        snap = self.resolve(coord, staged)
+        version = snap.version
+        base = snap.metadata.get("derived_from")
+        if base is None:
+            if not force:
+                raise SartreError(
+                    f"cannot safely promote {version}: it records no base (derived_from); "
+                    "re-derive with 'publish-over --stage', or force a last-writer promote"
+                )
+            try:  # force: plain last-writer against the pointer's current value
+                expected: Version | None = self.registry.head(coord, _pointer_ref(pointer))
+            except NotFound:
+                expected = None
+        else:
+            expected = cast(Version, base)  # base-CAS: moved pointer ⇒ Conflict
+        self.registry.set_pointer(
+            coord, pointer, version, expected=expected, actor=actor, reason=reason
+        )
+        return version
+
     def list_coordinates(self) -> Sequence[Coordinate]:
         """Every coordinate the registry holds (no blob fetch)."""
         return self.registry.list_coordinates()
@@ -541,3 +608,25 @@ class AsyncRepository:
         self, policy: RetentionPolicy | None = None, *, clock: Callable[[], datetime] | None = None
     ) -> GCResult:
         return await asyncio.to_thread(self._sync.gc, policy, clock=clock)
+
+    async def delete_pointer(
+        self, coord: Coordinate, name: str, *, actor: str = "unknown", reason: str | None = None
+    ) -> None:
+        return await asyncio.to_thread(
+            self._sync.delete_pointer, coord, name, actor=actor, reason=reason
+        )
+
+    async def promote(
+        self,
+        coord: Coordinate,
+        staged: Ref,
+        *,
+        pointer: str = "head",
+        force: bool = False,
+        actor: str = "unknown",
+        reason: str | None = None,
+    ) -> Version:
+        return await asyncio.to_thread(
+            self._sync.promote, coord, staged, pointer=pointer, force=force,
+            actor=actor, reason=reason,
+        )
