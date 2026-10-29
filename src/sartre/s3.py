@@ -154,17 +154,22 @@ class S3Registry:
                 continue
             if event.get("version") is None:  # pointer-tombstone: deleted, don't revert past it
                 return raw_seq, None
-            if not self._is_tombstoned(event["version"]):
+            if not self._is_tombstoned(event["version"], refresh=refresh):
                 return raw_seq, event["version"]
         return raw_seq, None
 
     def _resolve_ref(self, coord: Coordinate, ref: Ref) -> Version:
+        # A resolve is a read: re-list the pointer stream (and tombstone state) so a long-lived
+        # reader sharing a cached fs sees the current tail, not a frozen listing. The write path
+        # already refreshes; this is its read-side counterpart (model/S3Drop assumes a live tail).
         if isinstance(ref, Pin):
-            if self._is_tombstoned(ref.version) or ref.version not in self.list_versions(coord):
+            if self._is_tombstoned(ref.version, refresh=True) or (
+                ref.version not in self.list_versions(coord)
+            ):
                 raise NotFound(f"version {ref.version} not known for {coord}")
             return ref.version
         name = pointer_name(ref)
-        _seq, effective = self._pointer_scan(coord, name)
+        _seq, effective = self._pointer_scan(coord, name, refresh=True)
         if effective is None:
             raise NotFound(f"pointer {name!r} not set for {coord}")
         return effective
@@ -190,16 +195,17 @@ class S3Registry:
 
     def list_pointers(self, coord: Coordinate) -> Mapping[str, Version]:
         out: dict[str, Version] = {}
-        for name in self._list_names(f"{self._coord_root(coord)}/pointers"):
-            _seq, effective = self._pointer_scan(coord, name)  # skips tombstoned targets
+        # read path: re-list so a long-lived reader sees pointers advanced by other processes
+        for name in self._list_names(f"{self._coord_root(coord)}/pointers", refresh=True):
+            _seq, effective = self._pointer_scan(coord, name, refresh=True)  # skips tombstoned
             if effective is not None:
                 out[name] = effective
         return out
 
     def list_versions(self, coord: Coordinate) -> Sequence[Version]:
-        tombstoned = self._tombstoned_versions()  # one listing, not an fs.exists per event
+        tombstoned = self._tombstoned_versions(refresh=True)  # one listing, not fs.exists per event
         seen: dict[Version, None] = {}
-        for _name, _seq, event in self._all_events(coord):
+        for _name, _seq, event in self._all_events(coord, refresh=True):  # read: see new events
             v = event["version"]
             if v is not None and v not in tombstoned:  # skip pointer-tombstones (null version)
                 seen.setdefault(v, None)
@@ -225,7 +231,7 @@ class S3Registry:
                 reason=event.get("reason"),
             )
             for i, (_name, _seq, event) in enumerate(
-                e for e in self._all_events(coord) if e[2].get("version") is not None
+                e for e in self._all_events(coord, refresh=True) if e[2].get("version") is not None
             )
         ]
 
@@ -239,7 +245,7 @@ class S3Registry:
                 reason=event.get("reason"),
                 at=datetime.fromisoformat(event["at"]),
             )
-            for name, _seq, event in self._all_events(coord)
+            for name, _seq, event in self._all_events(coord, refresh=True)
         ]
 
     # --- Registry port: writes ---
@@ -369,13 +375,17 @@ class S3Registry:
     # --- helpers ---
 
     def _all_events(
-        self, coord: Coordinate
+        self, coord: Coordinate, *, refresh: bool = False
     ) -> list[tuple[str, int, dict[str, Any]]]:
-        """Every pointer-move event of a coordinate, merged across pointers by (at, name, seq)."""
+        """Every pointer-move event of a coordinate, merged across pointers by (at, name, seq).
+
+        ``refresh`` re-lists the event streams so a long-lived reader sees events appended by
+        other processes (the read paths pass it; the listing cache otherwise freezes them).
+        """
         events: list[tuple[str, int, dict[str, Any]]] = []
-        for name in self._list_names(f"{self._coord_root(coord)}/pointers"):
+        for name in self._list_names(f"{self._coord_root(coord)}/pointers", refresh=refresh):
             prefix = self._pointer_prefix(coord, name)
-            for key in self._list_names(prefix):
+            for key in self._list_names(prefix, refresh=refresh):
                 if key.endswith(".json"):
                     event = self._get_json(f"{prefix}/{key}")
                     if event is not None:
@@ -383,16 +393,22 @@ class S3Registry:
         events.sort(key=lambda t: (t[2]["at"], t[0], t[1]))
         return events
 
-    def _tombstoned_versions(self) -> set[Version]:
-        """Every dropped version, from one listing of the tombstone namespace (per algo)."""
+    def _tombstoned_versions(self, *, refresh: bool = False) -> set[Version]:
+        """Every dropped version, from one listing of the tombstone namespace (per algo).
+
+        ``refresh`` re-lists so a long-lived reader sees tombstones written by a concurrent GC.
+        """
         return {
             f"{algo}:{digest}"
-            for algo in self._list_names(f"{self.root}/tombstones")
-            for digest in self._list_names(f"{self.root}/tombstones/{algo}")
+            for algo in self._list_names(f"{self.root}/tombstones", refresh=refresh)
+            for digest in self._list_names(f"{self.root}/tombstones/{algo}", refresh=refresh)
         }
 
-    def _is_tombstoned(self, version: Version) -> bool:
-        return self._exists(self._tombstone_path(version))
+    def _is_tombstoned(self, version: Version, *, refresh: bool = False) -> bool:
+        path = self._tombstone_path(version)
+        if refresh:  # read paths bypass the cache so a concurrent tombstone is honored
+            self.fs.invalidate_cache(path)
+        return self._exists(path)
 
 
 def _probe_conditional_writes(fs: AbstractFileSystem, root: str) -> None:
