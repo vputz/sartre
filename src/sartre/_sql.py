@@ -91,6 +91,7 @@ class _SqlRegistry:
             f"CREATE TABLE IF NOT EXISTS pointer_moves (move_seq {self._SEQ_TYPE}, "
             "coord_name TEXT NOT NULL, coord_env TEXT NOT NULL, pointer TEXT NOT NULL, "
             "from_version TEXT, to_version TEXT, "  # to_version NULL == a pointer deletion
+            "base_version TEXT, "  # staging advances only: the derive base promote CAS-es against
             "actor TEXT NOT NULL, reason TEXT, at TEXT NOT NULL)",
             f"CREATE TABLE IF NOT EXISTS leases (lease_id {self._SEQ_TYPE}, "
             f"version TEXT NOT NULL, hashes TEXT NOT NULL, expires_at {self._TS_TYPE} NOT NULL)",
@@ -214,7 +215,7 @@ class _SqlRegistry:
         with self._lock:
             rows = self._exec(
                 self._conn,
-                "SELECT pointer, from_version, to_version, actor, reason, at "
+                "SELECT pointer, from_version, to_version, base_version, actor, reason, at "
                 "FROM pointer_moves WHERE coord_name=? AND coord_env=? ORDER BY move_seq",
                 (coord.name, coord.env),
             ).fetchall()
@@ -223,12 +224,24 @@ class _SqlRegistry:
                     name=r[0],
                     from_version=r[1],
                     to_version=r[2],
-                    actor=r[3],
-                    reason=r[4],
-                    at=datetime.fromisoformat(r[5]),
+                    base=r[3],
+                    actor=r[4],
+                    reason=r[5],
+                    at=datetime.fromisoformat(r[6]),
                 )
                 for r in rows
             ]
+
+    def pointer_base(self, coord: Coordinate, name: str) -> Version | None:
+        with self._lock:
+            row = self._exec(
+                self._conn,
+                "SELECT base_version FROM pointer_moves "
+                "WHERE coord_name=? AND coord_env=? AND pointer=? AND to_version IS NOT NULL "
+                "ORDER BY move_seq DESC LIMIT 1",  # newest advance, past tombstones
+                (coord.name, coord.env, name),
+            ).fetchone()
+            return row[0] if row is not None else None
 
     # --- Registry port: write surface ---
 
@@ -262,6 +275,7 @@ class _SqlRegistry:
         version: Version,
         *,
         expected: Version | None,
+        base: Version | None = None,
         actor: str = "unknown",
         reason: str | None = None,
     ) -> None:
@@ -299,8 +313,8 @@ class _SqlRegistry:
             self._exec(  # append-only provenance audit; from_version = prior value (expected)
                 conn,
                 "INSERT INTO pointer_moves(coord_name, coord_env, pointer, from_version, "
-                "to_version, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (coord.name, coord.env, name, expected, version, actor, reason, now),
+                "to_version, base_version, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (coord.name, coord.env, name, expected, version, base, actor, reason, now),
             )
 
     def delete_pointer(
@@ -335,11 +349,11 @@ class _SqlRegistry:
                     f"pointer {name!r} for {coord} moved during delete, expected {expected}"
                 )
             now = datetime.now(UTC).isoformat()
-            self._exec(  # a deletion is a move to nothing (to_version NULL)
+            self._exec(  # a deletion is a move to nothing (to_version NULL, base NULL)
                 conn,
                 "INSERT INTO pointer_moves(coord_name, coord_env, pointer, from_version, "
-                "to_version, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (coord.name, coord.env, name, current, None, actor, reason, now),
+                "to_version, base_version, actor, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (coord.name, coord.env, name, current, None, None, actor, reason, now),
             )
 
     def drop_version(self, version: Version) -> None:

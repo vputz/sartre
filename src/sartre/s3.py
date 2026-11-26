@@ -241,12 +241,28 @@ class S3Registry:
                 name=name,
                 from_version=event.get("from"),
                 to_version=event["version"],
+                base=event.get("base"),  # None for pre-change events and non-staging moves
                 actor=event.get("actor", "unknown"),
                 reason=event.get("reason"),
                 at=datetime.fromisoformat(event["at"]),
             )
             for name, _seq, event in self._all_events(coord, refresh=True)
         ]
+
+    def pointer_base(self, coord: Coordinate, name: str) -> Version | None:
+        # Read only this pointer's own event stream (never the whole coordinate): the newest
+        # advance's recorded base, skipping past a later deletion tombstone (version null).
+        prefix = self._pointer_prefix(coord, name)
+        keys = sorted(
+            (k for k in self._list_names(prefix, refresh=True) if k.endswith(".json")),
+            reverse=True,  # newest first
+        )
+        for key in keys:
+            event = self._get_json(f"{prefix}/{key}")
+            if event is None or event.get("version") is None:  # skip gaps and deletion tombstones
+                continue
+            return event.get("base")  # newest advance; null base for a non-staging advance
+        return None
 
     # --- Registry port: writes ---
 
@@ -272,6 +288,7 @@ class S3Registry:
         version: Version,
         *,
         expected: Version | None,
+        base: Version | None = None,
         actor: str = "unknown",
         reason: str | None = None,
     ) -> None:
@@ -288,6 +305,7 @@ class S3Registry:
                     "seq": seq + 1,
                     "version": version,
                     "from": current,
+                    "base": base,  # staging advances only; null otherwise (schemaless key)
                     "actor": actor,
                     "reason": reason,
                     "at": datetime.now(UTC).isoformat(),

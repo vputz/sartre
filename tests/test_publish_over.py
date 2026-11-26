@@ -315,7 +315,9 @@ def test_stage_lands_off_head_and_records_base() -> None:
 
     assert repo.head(COORD, Alias(r.staged_pointer)) == r.version  # staged on that pointer
     snap = repo.resolve(COORD, Alias(r.staged_pointer))
-    assert snap.metadata["derived_from"] == base  # recorded for a base-CAS promote
+    assert "derived_from" not in snap.metadata  # base is NOT recorded in manifest metadata
+    # the base lives on the staging pointer's own move (a base-CAS promote recovers it there)
+    assert repo.registry.pointer_base(COORD, r.staged_pointer) == base
     got = repo.promote(COORD, Alias(r.staged_pointer))
     assert got == r.version and repo.head(COORD) == r.version
 

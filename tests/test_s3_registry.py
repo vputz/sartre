@@ -428,3 +428,43 @@ def test_open_s3_rejects_non_conforming_endpoint() -> None:
 
     with pytest.raises(SartreError, match="put-if-absent"):
         _probe_conditional_writes(_NoCasFS(), "root")  # type: ignore[arg-type]
+
+
+def test_s3_pointer_base_recovers_past_a_tombstone(registry: S3Registry) -> None:
+    """pointer_base reads the newest advance's base from the pointer's own stream, even after a
+    deletion tombstone is appended above it (resolving the pointer would raise NotFound)."""
+    v1 = registry.commit(COORD, _entries("a"), {})
+    v2 = registry.commit(COORD, _entries("b"), {})
+    registry.set_pointer(COORD, "staging-x", v2, expected=None, base=v1, actor="t")
+    assert registry.pointer_base(COORD, "staging-x") == v1
+    registry.delete_pointer(COORD, "staging-x", expected=v2, actor="t")  # tombstone above advance
+    with pytest.raises(NotFound):
+        registry.head(COORD, Alias("staging-x"))  # resolution stops at the tombstone
+    assert registry.pointer_base(COORD, "staging-x") == v1  # but the base is still recoverable
+
+
+def test_s3_base_and_pointer_base_differential_with_reference(s3: _S3Ctx) -> None:
+    """S3 agrees with the in-memory oracle on the recorded base and pointer_base over staging
+    advances, a deletion, and a re-stage."""
+    from sartre import MemoryRegistry
+
+    mem = MemoryRegistry()
+    s3reg = s3.registry
+    c = COORD
+    va = mem.commit(c, _entries("a"), {})
+    assert va == s3reg.commit(c, _entries("a"), {})
+    vb = mem.commit(c, _entries("b"), {})
+    assert vb == s3reg.commit(c, _entries("b"), {})
+
+    def apply(fn) -> None:  # noqa: ANN001
+        fn(mem)
+        fn(s3reg)
+
+    apply(lambda r: r.set_pointer(c, "staging-x", va, expected=None, base=vb, actor="t"))
+    apply(lambda r: r.delete_pointer(c, "staging-x", expected=va, actor="t"))
+    apply(lambda r: r.set_pointer(c, "staging-x", vb, expected=None, base=va, actor="t"))
+
+    assert mem.pointer_base(c, "staging-x") == s3reg.pointer_base(c, "staging-x") == va
+    mem_bases = [(m.name, m.base) for m in mem.list_pointer_history(c)]
+    s3_bases = [(m.name, m.base) for m in s3reg.list_pointer_history(c)]
+    assert mem_bases == s3_bases  # the base field agrees move-for-move

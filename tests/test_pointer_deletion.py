@@ -154,43 +154,36 @@ def test_facade_delete_absent_alias_is_noop() -> None:
 def test_promote_clean_stage_advances_head() -> None:
     repo = _repo()
     base = repo.publish(COORD, {"a.txt": b"A"})
-    staged = repo.publish_over(
-        COORD, changes={"a.txt": b"B"}, pointer=f"staging-{uuid.uuid4().hex[:8]}",
-        metadata={"derived_from": base},
-    ).version
-    # head still at base → base-CAS promote succeeds
-    got = repo.promote(COORD, Alias(_only_staging(repo)))
-    assert got == staged
-    assert repo.head(COORD) == staged
+    r = repo.publish_over(COORD, changes={"a.txt": b"B"}, stage=True)
+    assert r.staged_pointer is not None
+    # head still at base → base-CAS promote succeeds (base recovered from the staging move)
+    got = repo.promote(COORD, Alias(r.staged_pointer))
+    assert got == r.version
+    assert repo.head(COORD) == r.version
+    assert base != r.version
 
 
 def test_promote_conflicts_when_head_moved() -> None:
     repo = _repo()
-    base = repo.publish(COORD, {"a.txt": b"A"})
-    sp = f"staging-{uuid.uuid4().hex[:8]}"
-    staged = repo.publish_over(
-        COORD, changes={"a.txt": b"B"}, pointer=sp, metadata={"derived_from": base},
-    ).version
+    repo.publish(COORD, {"a.txt": b"A"})
+    r = repo.publish_over(COORD, changes={"a.txt": b"B"}, stage=True)
+    assert r.staged_pointer is not None
     moved = repo.publish(COORD, {"a.txt": b"C"})  # head advances off base during "verification"
     with pytest.raises(Conflict):
-        repo.promote(COORD, Alias(sp))
+        repo.promote(COORD, Alias(r.staged_pointer))
     assert repo.head(COORD) == moved  # concurrent publish not clobbered
-    assert staged != moved
+    assert r.version != moved
 
 
-def test_promote_refuses_without_derived_from() -> None:
+def test_promote_refuses_without_recorded_base() -> None:
     repo = _repo()
     repo.publish(COORD, {"a.txt": b"A"})
     v2 = repo.publish_over(COORD, changes={"a.txt": b"B"}, pointer="handmade").version
     with pytest.raises(SartreError):
-        repo.promote(COORD, Alias("handmade"))  # no derived_from
+        repo.promote(COORD, Alias("handmade"))  # a non-staging alias records no base
     # force falls back to last-writer against current head
     got = repo.promote(COORD, Alias("handmade"), force=True)
     assert got == v2 and repo.head(COORD) == v2
-
-
-def _only_staging(repo: Repository) -> str:
-    return next(n for n in repo.list_pointers(COORD) if n.startswith("staging-"))
 
 
 # --- property (§6.4) ---
@@ -239,26 +232,25 @@ def test_cli_delete_pointer_and_refuse_head(tmp_path: Path) -> None:
     assert r.exit_code != 0 and "head" in r.output
 
 
-def test_cli_stage_records_derived_from_and_promote(tmp_path: Path) -> None:
+def test_cli_stage_and_promote(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     f = tmp_path / "a.txt"
     f.write_bytes(b"A")
-    v1 = _run(repo, "publish", "m/prod", str(f), "--as", "a").stdout.strip()
+    _run(repo, "publish", "m/prod", str(f), "--as", "a")
     f2 = tmp_path / "a2.txt"
     f2.write_bytes(b"B")
     r = _run(repo, "--json", "publish-over", "m/prod", f"a.txt={f2}", "--stage", "--as", "b")
     assert r.exit_code == 0, r.output
     out = json.loads(r.stdout)
     staged, version = out["staged"], out["version"]
-    # derived_from recorded on the staged version
+    # the base is on the staging pointer's move, not in manifest metadata
     show = json.loads(_run(repo, "--json", "show", f"m/prod:{staged}").stdout)
-    assert show["metadata"]["derived_from"] == v1
-    # promote advances head and cleans up the staging alias
+    assert "derived_from" not in show["metadata"]
+    # promote recovers the base from the staging pointer, advances head, and cleans up the alias
     r = _run(repo, "promote", "m/prod", staged, "--as", "b", "-m", "verified")
     assert r.exit_code == 0, r.output
     assert _run(repo, "head", "m/prod").stdout.strip() == version
-    # the staging alias is cleaned up
-    assert _run(repo, "head", f"m/prod:{staged}").exit_code != 0
+    assert _run(repo, "head", f"m/prod:{staged}").exit_code != 0  # staging alias cleaned up
 
 
 def test_cli_promote_refuses_when_head_moved(tmp_path: Path) -> None:

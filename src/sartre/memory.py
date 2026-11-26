@@ -138,6 +138,7 @@ class MemoryRegistry:
         version: Version,
         *,
         expected: Version | None,
+        base: Version | None = None,
         actor: str = "unknown",
         reason: str | None = None,
     ) -> None:
@@ -168,6 +169,7 @@ class MemoryRegistry:
                     name=name,
                     from_version=current,
                     to_version=version,
+                    base=base,  # set only for staging advances; None otherwise
                     actor=actor,
                     reason=reason,
                     at=now,
@@ -231,6 +233,17 @@ class MemoryRegistry:
         with self._lock:
             state = self._peek(coord)
             return list(state.moves) if state else []
+
+    def pointer_base(self, coord: Coordinate, name: str) -> Version | None:
+        with self._lock:
+            state = self._peek(coord)
+            if state is None:
+                return None
+            # Newest advance (to_version set), reading past any later deletion tombstone.
+            for move in reversed(state.moves):
+                if move.name == name and move.to_version is not None:
+                    return move.base
+            return None
 
     def drop_version(self, version: Version) -> None:
         with self._lock:

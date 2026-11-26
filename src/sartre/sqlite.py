@@ -36,33 +36,45 @@ class SqliteRegistry(_SqlRegistry):
         return sqlite3.connect(self._db_path, check_same_thread=False, isolation_level=None)
 
     def _migrate(self, conn: _Conn) -> None:
-        """Relax `pointer_moves.to_version` to nullable in a pre-existing database.
+        """Bring a pre-existing `pointer_moves` table up to the current schema. Idempotent.
 
-        SQLite has no ``ALTER COLUMN … DROP NOT NULL``, so rebuild the table (create-new →
-        copy → swap) only when the column is still ``NOT NULL``. Rows are preserved; the
-        rebuild is wrapped in a transaction so a crash cannot leave a half-migrated schema.
+        Two additive migrations:
+        1. Relax `to_version` to nullable. SQLite has no ``ALTER COLUMN … DROP NOT NULL``, so
+           rebuild the table (create-new → copy → swap) only when the column is still
+           ``NOT NULL``. The rebuild recreates with the current schema (which already includes
+           ``base_version``), so it covers both migrations at once.
+        2. Add the nullable `base_version` column via ``ADD COLUMN`` when a DB whose
+           `to_version` is already nullable simply lacks the column (no rebuild needed).
+
+        Rows are preserved; the rebuild is wrapped in a transaction so a crash cannot leave a
+        half-migrated schema.
         """
         info = conn.execute("PRAGMA table_info(pointer_moves)").fetchall()
         # PRAGMA columns: (cid, name, type, notnull, dflt_value, pk)
-        if not any(c[1] == "to_version" and c[3] == 1 for c in info):
-            return  # already nullable (fresh DB or already migrated)
-        create = next(s for s in self._schema() if "CREATE TABLE IF NOT EXISTS pointer_moves" in s)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute("DROP TABLE IF EXISTS pointer_moves_old")
-            conn.execute("ALTER TABLE pointer_moves RENAME TO pointer_moves_old")
-            conn.execute(create)  # recreates with nullable to_version
-            conn.execute(
-                "INSERT INTO pointer_moves(move_seq, coord_name, coord_env, pointer, "
-                "from_version, to_version, actor, reason, at) "
-                "SELECT move_seq, coord_name, coord_env, pointer, from_version, to_version, "
-                "actor, reason, at FROM pointer_moves_old"
+        cols = {c[1] for c in info}
+        if any(c[1] == "to_version" and c[3] == 1 for c in info):
+            create = next(
+                s for s in self._schema() if "CREATE TABLE IF NOT EXISTS pointer_moves" in s
             )
-            conn.execute("DROP TABLE pointer_moves_old")
-            conn.execute("COMMIT")
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DROP TABLE IF EXISTS pointer_moves_old")
+                conn.execute("ALTER TABLE pointer_moves RENAME TO pointer_moves_old")
+                conn.execute(create)  # recreates with nullable to_version AND base_version
+                conn.execute(
+                    "INSERT INTO pointer_moves(move_seq, coord_name, coord_env, pointer, "
+                    "from_version, to_version, actor, reason, at) "
+                    "SELECT move_seq, coord_name, coord_env, pointer, from_version, to_version, "
+                    "actor, reason, at FROM pointer_moves_old"
+                )
+                conn.execute("DROP TABLE pointer_moves_old")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            return  # the rebuild already recreated the table with base_version
+        if "base_version" not in cols:  # already-nullable DB that predates base_version
+            conn.execute("ALTER TABLE pointer_moves ADD COLUMN base_version TEXT")
 
     @contextmanager
     def _tx(self) -> Iterator[_Conn]:

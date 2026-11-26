@@ -52,6 +52,12 @@ class PointerMove:
     ``from_version`` is ``None`` when the pointer was created (had no prior value).
     ``to_version`` is ``None`` when the move is a *deletion* (the pointer was removed). A move
     is recorded only for a *successful* compare-and-swap; a rejected CAS records nothing.
+
+    ``base`` is the version a *staging advance* was derived from (``publish_over(stage=True)``);
+    it is ``None`` for every other move, where ``from_version`` is already the compare-and-swap
+    base. It is a per-operation fact on the non-deduplicated pointer-move plane — the source
+    :meth:`Registry.pointer_base` returns and ``promote`` compare-and-swaps a staged version
+    against.
     """
 
     name: str
@@ -60,6 +66,7 @@ class PointerMove:
     actor: str
     reason: str | None
     at: datetime
+    base: Version | None = None
 
 
 @runtime_checkable
@@ -117,6 +124,7 @@ class Registry(Protocol):
         version: Version,
         *,
         expected: Version | None,
+        base: Version | None = None,
         actor: str = "unknown",
         reason: str | None = None,
     ) -> None:
@@ -128,8 +136,12 @@ class Registry(Protocol):
         success, within the same transaction: stamp ``actor``/``reason`` on the tip
         (commit-log) event appended for this move, and append one :class:`PointerMove`
         to the coordinate's pointer-move history capturing ``(name, expected, version,
-        actor, reason, now)``. A rejected CAS writes neither. ``actor`` defaults to
+        base, actor, reason, now)``. A rejected CAS writes neither. ``actor`` defaults to
         ``"unknown"`` when omitted — this is the sole write point for change provenance.
+
+        ``base`` records the version a staging advance was derived from; it is written only
+        for staging advances (``None`` otherwise) and is the value :meth:`pointer_base`
+        later returns for this pointer.
         """
         ...
 
@@ -172,9 +184,20 @@ class Registry(Protocol):
     def list_pointer_history(self, coord: Coordinate) -> Sequence[PointerMove]:
         """Return the coordinate's pointer-move history in append order (oldest first).
 
-        Each :class:`PointerMove` carries ``(name, from_version, to_version, actor, reason,
-        at)``, answering "who moved this pointer, from what, to what, and why." The history
-        is append-only.
+        Each :class:`PointerMove` carries ``(name, from_version, to_version, base, actor,
+        reason, at)``, answering "who moved this pointer, from what, to what, and why." The
+        ``base`` is set only for staging advances. The history is append-only.
+        """
+        ...
+
+    def pointer_base(self, coord: Coordinate, name: str) -> Version | None:
+        """Return the derive base recorded on ``name``'s newest advance move, else ``None``.
+
+        Contract: read only this single pointer's own record — MUST NOT scan the whole
+        coordinate's pointer-move history. Return the ``base`` of the pointer's newest
+        advance **even when a later deletion tombstone sits above it** (unlike pointer
+        resolution, which stops at a tombstone), and ``None`` when no advance recorded a
+        base. This is the base ``promote`` compare-and-swaps a staged version against.
         """
         ...
 

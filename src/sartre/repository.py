@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO
 
 from sartre.errors import Conflict, LeaseExpired, NotFound, PathError, SartreError
 from sartre.fs import SnapshotFS
@@ -261,6 +261,7 @@ class Repository:
         metadata: Mapping[str, object] | None,
         actor: str,
         reason: str | None,
+        base: Version | None = None,
     ) -> Version:
         """Lease → upload the given sources → commit → advance — shared by publish/publish_over.
 
@@ -304,7 +305,7 @@ class Repository:
             if not self.registry.renew_lease(lease, self._lease_ttl):  # self-check before advance
                 raise LeaseExpired("write lease lapsed before pointer advance; retry")
             self.registry.set_pointer(  # CAS; stamps provenance on the tip event
-                coord, pointer, committed, expected=expected, actor=actor, reason=reason
+                coord, pointer, committed, expected=expected, base=base, actor=actor, reason=reason
             )
             return committed
         finally:
@@ -389,12 +390,14 @@ class Repository:
         inherited = len(entries) - replaced - added - renamed
 
         # Staging derives onto a self-named, content-derived pointer (never head) and records
-        # the base so a later `promote` can base-CAS against it.
+        # the base on that pointer's move (not in manifest metadata, which is content-addressed
+        # and first-writer-wins) so a later `promote` can base-CAS against it.
         staged_pointer: str | None = None
+        move_base: Version | None = None
         if stage:
             staged_pointer = _staging_pointer_name(base_snap.version, affected)
             pointer = staged_pointer
-            metadata = {**(metadata or {}), "derived_from": base_snap.version}
+            move_base = base_snap.version
 
         # Pin the advance to the base when advancing the very pointer the base names;
         # otherwise standard CAS on the advanced pointer's current value (None if unset).
@@ -411,7 +414,7 @@ class Repository:
 
         version = self._write_version(
             coord, entries, uploads, pointer=pointer, expected=expected,
-            metadata=metadata, actor=actor, reason=reason,
+            metadata=metadata, actor=actor, reason=reason, base=move_base,
         )
         return PublishOverResult(
             version, inherited, replaced, added, removed, renamed, staged_pointer
@@ -570,33 +573,60 @@ class Repository:
     ) -> Version:
         """Advance ``pointer`` to the version ``staged`` resolves to, base-CAS-safe.
 
-        Compare-and-swaps ``pointer`` against the staged version's recorded base
-        (``derived_from`` metadata, written by ``publish-over --stage``), not the pointer's
-        current value — so a publish that advanced the pointer since staging raises
-        :class:`~sartre.errors.Conflict` rather than silently overwriting it (the lost update
-        ``model/PublishOver.tla`` closes for the direct advance). A staged version with no
-        recorded base (a hand-made alias, or one staged before this existed) is refused unless
-        ``force``, which falls back to a plain last-writer move against the current value.
-        Returns the promoted version.
+        Compare-and-swaps ``pointer`` against the base the staged version was derived from —
+        recovered from the **staging pointer's own move** (``publish_over(stage=True)`` records
+        it there), via :meth:`Registry.pointer_base`, not from manifest metadata — so a publish
+        that advanced the pointer to a *different* tree since staging raises
+        :class:`~sartre.errors.Conflict` rather than silently overwriting it (the lost-update
+        guard verified in ``model/Promote.tla``). If ``pointer`` already holds the target
+        version (a concurrent/duplicate publish of the same tree), this is a success no-op —
+        checked both before the base lookup and after a CAS conflict. When ``staged`` is not an
+        alias (a ``Pin`` or ``Head`` ref) or its move records no base (a hand-made alias, or one
+        staged before this behavior), it is refused unless ``force``, which falls back to a plain
+        last-writer move against the pointer's current value. Returns the promoted version.
         """
         snap = self.resolve(coord, staged)
         version = snap.version
-        base = snap.metadata.get("derived_from")
+
+        # No-op if the pointer already holds the target — a duplicate publish of the same
+        # content-addressed tree is not a conflict. Checked before any base lookup.
+        try:
+            if self.registry.head(coord, _pointer_ref(pointer)) == version:
+                return version
+        except NotFound:
+            pass  # pointer unset → proceed to the base-CAS
+
+        # Recover the derive base from the staging pointer's own move; otherwise refuse/force.
+        base = self.registry.pointer_base(coord, staged.name) if isinstance(staged, Alias) else None
         if base is None:
             if not force:
                 raise SartreError(
-                    f"cannot safely promote {version}: it records no base (derived_from); "
-                    "re-derive with 'publish-over --stage', or force a last-writer promote"
+                    f"cannot safely promote {version}: no derive base is recorded for it. "
+                    "Promote via the staging alias, re-derive with 'publish-over --stage', "
+                    "or force a last-writer promote."
                 )
             try:  # force: plain last-writer against the pointer's current value
                 expected: Version | None = self.registry.head(coord, _pointer_ref(pointer))
             except NotFound:
                 expected = None
         else:
-            expected = cast(Version, base)  # base-CAS: moved pointer ⇒ Conflict
-        self.registry.set_pointer(
-            coord, pointer, version, expected=expected, actor=actor, reason=reason
-        )
+            expected = base  # base-CAS: a pointer moved to a different tree ⇒ Conflict
+
+        try:
+            self.registry.set_pointer(
+                coord, pointer, version, expected=expected, actor=actor, reason=reason
+            )
+        except Conflict:
+            # A duplicate publish of the same tree may have advanced the pointer to the target
+            # between the no-op check and the CAS — that is success, not a conflict. Any other
+            # value is a genuine move to a different tree, so propagate.
+            try:
+                landed = self.registry.head(coord, _pointer_ref(pointer))
+            except NotFound:
+                landed = None
+            if landed == version:
+                return version
+            raise
         return version
 
     def list_coordinates(self) -> Sequence[Coordinate]:

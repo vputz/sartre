@@ -44,12 +44,14 @@ class PostgresRegistry(_SqlRegistry):
         return psycopg.connect(self._dsn, autocommit=True)
 
     def _migrate(self, conn: _Conn) -> None:
-        """Relax `pointer_moves.to_version` to nullable so deletions (NULL target) record.
+        """Bring `pointer_moves` up to the current schema. Idempotent on fresh and old DBs.
 
-        ``DROP NOT NULL`` on an already-nullable column is a no-op in Postgres, so this is
-        idempotent and safe on both fresh and pre-existing databases.
+        Relax `to_version` to nullable so deletions (NULL target) record, and add the nullable
+        `base_version` column for staging-advance bases. ``DROP NOT NULL`` on an already-nullable
+        column and ``ADD COLUMN IF NOT EXISTS`` are both no-ops when already applied.
         """
         conn.execute("ALTER TABLE pointer_moves ALTER COLUMN to_version DROP NOT NULL")
+        conn.execute("ALTER TABLE pointer_moves ADD COLUMN IF NOT EXISTS base_version TEXT")
 
     @contextmanager
     def _tx(self) -> Iterator[_Conn]:
