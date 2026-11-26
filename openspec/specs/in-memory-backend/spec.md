@@ -63,11 +63,15 @@ live system: the tip is always a committed manifest whose blobs are all present
   manifest, matching the `PointerSafe` invariant verified by the TLA+ model
 
 ### Requirement: In-memory backend mirrors change provenance
-The in-memory reference backend SHALL record commit `actor`/`reason` on its per-coordinate commit log and SHALL maintain an in-memory append-only pointer-move history, so that `list_log` and `list_pointer_history` behave identically to the persistent backend. This keeps the reference backend a faithful oracle for differential testing of provenance.
+The in-memory reference backend SHALL record commit `actor`/`reason` on its per-coordinate commit log and SHALL maintain an in-memory append-only pointer-move history, recording the optional `base` on each move (set only for staging advances), so that `list_log` and `list_pointer_history` behave identically to the persistent backend. It SHALL implement `pointer_base(coord, name)` by returning the base on the pointer's newest advance move (reading past a later deletion tombstone), matching the other backends. This keeps the reference backend a faithful oracle for differential testing of provenance, including the base field and `pointer_base`.
 
 #### Scenario: Reference backend reports commit and move provenance
 - **WHEN** a version is committed and a pointer moved with an actor and reason against the in-memory backend
-- **THEN** `list_log` exposes the commit's actor/reason and `list_pointer_history` exposes the move's from/to versions, actor, reason, and time — matching the persistent backend for the same sequence
+- **THEN** `list_log` exposes the commit's actor/reason and `list_pointer_history` exposes the move's from/to versions, base, actor, reason, and time — matching the persistent backend for the same sequence
+
+#### Scenario: Reference backend recovers a staged base
+- **WHEN** a staging advance recorded `base=b` against the in-memory backend and `pointer_base(coord, name)` is called (including after the staging pointer is deleted)
+- **THEN** it returns `b`, matching the persistent and S3 backends for the same sequence
 
 ### Requirement: In-memory backend supports pointer deletion
 The in-memory reference backend SHALL implement `delete_pointer` under its lock: with the lock held it SHALL compare the pointer's current value to `expected`, raise `Conflict` on a mismatch, otherwise remove the pointer and append the corresponding deletion to its pointer-move history. Deleting an absent pointer with `expected=None` SHALL be a no-op. This preserves the backend's role as the executable oracle the persistent and S3 backends are checked against.

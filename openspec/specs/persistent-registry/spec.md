@@ -108,15 +108,19 @@ backend.
   and GC hosts with skewed local clocks agree on which leases are live
 
 ### Requirement: Durable commit provenance and pointer-move history
-The persistent registry SHALL store commit provenance and pointer-move history durably. The commit-log table SHALL include `actor` and `reason` columns written in the commit transaction. A `pointer_moves` table SHALL record one row per successful pointer move — `(coordinate, pointer, from_version, to_version, actor, reason, at)` — inserted within the same transaction as the pointer compare-and-swap, using the backend's timestamp/`NOW` dialect hooks for `at`. Both SHALL survive process restart and SHALL be readable via `list_log` and `list_pointer_history`.
+The persistent registry SHALL store commit provenance and pointer-move history durably. The commit-log table SHALL include `actor` and `reason` columns written in the commit transaction. A `pointer_moves` table SHALL record one row per successful pointer move — `(coordinate, pointer, from_version, to_version, base_version, actor, reason, at)` — inserted within the same transaction as the pointer compare-and-swap, using the backend's timestamp/`NOW` dialect hooks for `at`. The `base_version` column SHALL be nullable and SHALL be written only for staging advances (null otherwise). Both tables SHALL survive process restart and SHALL be readable via `list_log` and `list_pointer_history`, and `pointer_base(coord, name)` SHALL be served as a single query for that pointer's newest advance row carrying a non-null `base_version`.
 
 #### Scenario: Provenance survives a restart
 - **WHEN** a version is committed and a pointer moved with an actor and reason, then the registry is reopened
-- **THEN** `list_log` reports the commit's actor and reason and `list_pointer_history` reports the move's from/to versions, actor, reason, and time
+- **THEN** `list_log` reports the commit's actor and reason and `list_pointer_history` reports the move's from/to versions, base, actor, reason, and time
 
 #### Scenario: Move history is written under the CAS transaction
 - **WHEN** a pointer move succeeds
 - **THEN** exactly one `pointer_moves` row is committed atomically with the pointer advance; a rejected move commits no row
+
+#### Scenario: A staged base survives a restart and is read without a history scan
+- **WHEN** a staging advance recorded `base_version=b`, the registry is reopened, and `pointer_base(coord, name)` is called
+- **THEN** it returns `b` from a single latest-advance-row query, not by enumerating the coordinate's history
 
 ### Requirement: Durable pointer deletion with nullable move target
 The durable (SQLite/Postgres) registry SHALL delete a pointer as a single conditional `DELETE` guarded so the removal applies only when the current value equals `expected` (a row-count of one), within the same transaction as the appended pointer-move row — so deletion is atomic and compare-and-swap-safe under concurrent writers. The `pointer_moves` schema SHALL permit a null move target (`to_version` nullable) to record a deletion, and existing databases SHALL be migrated to the nullable column without loss of history. A deletion of an absent pointer with `expected=None` SHALL be a no-op.
@@ -132,3 +136,14 @@ The durable (SQLite/Postgres) registry SHALL delete a pointer as a single condit
 #### Scenario: Existing database migrates to the nullable column
 - **WHEN** a registry created before this change is opened
 - **THEN** its `pointer_moves.to_version` column is relaxed to nullable and all prior rows remain readable and unchanged
+
+### Requirement: Additive migration for the pointer-move base column
+The durable (SQLite/Postgres) registry SHALL add the nullable `base_version` column to an existing `pointer_moves` table via an additive `ALTER TABLE ... ADD COLUMN` in the `_migrate` hook on open. The migration SHALL NOT rewrite or backfill existing rows, and SHALL be idempotent on a store that already has the column.
+
+#### Scenario: Existing database gains the nullable column
+- **WHEN** a registry created before this change is opened
+- **THEN** its `pointer_moves` table gains a nullable `base_version` column, all prior rows remain readable with `base_version` null, and no row is rewritten
+
+#### Scenario: Re-opening an already-migrated database is a no-op
+- **WHEN** a registry that already has the `base_version` column is opened again
+- **THEN** the migration makes no change and all data is intact
